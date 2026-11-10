@@ -1,0 +1,2570 @@
+local _, CK = ...
+local L = CK.L
+
+-- Module "gamepad mapping": WoW Forever's gamepad UI is never changed. This
+-- module only adds functions on the inputs the game leaves free: the back
+-- paddles, and the buttons and trigger combinations nothing is bound to
+-- (L3, R3, LT + Start...). A free input can run a game function (any key
+-- binding command: run / walk, game menu, map...), a spell, an item, a macro,
+-- or press a button of the gamepad action bar.
+--
+-- "Free" is checked against the game's own bindings every time ours are set,
+-- with ours removed first: an input the game uses is never taken. Our
+-- bindings are plain override bindings of our own frame, set out of combat
+-- while no gamepad window has the focus; the game's windows bind their keys
+-- with priority above them, and ours are set again when they close.
+--
+-- The game's own buttons can be replaced too (see "The game's buttons,
+-- replaced"); the Gamepad tab gives them all back to the game at once.
+local M = {}
+CK.Mapping = M
+
+M.LAYERS = { "", "LT", "RT", "LTRT" }
+
+-- Every input, where it sits on a controller (x, y in the mapping window)
+M.INPUTS = {
+    { id = "LT", key = "PADLTRIGGER", x = 60, y = 40, layer = true },
+    { id = "LB", key = "PADLSHOULDER", x = 140, y = 40 },
+    { id = "RB", key = "PADRSHOULDER", x = 330, y = 40 },
+    { id = "RT", key = "PADRTRIGGER", x = 410, y = 40, layer = true },
+    { id = "UP", key = "PADDUP", x = 110, y = 126, bar = "up" },
+    { id = "LEFT", key = "PADDLEFT", x = 66, y = 170, bar = "left" },
+    { id = "RIGHT", key = "PADDRIGHT", x = 154, y = 170, bar = "right" },
+    { id = "DOWN", key = "PADDDOWN", x = 110, y = 214, bar = "down" },
+    { id = "SELECT", key = "PADBACK", x = 200, y = 150 },
+    { id = "START", key = "PADFORWARD", x = 270, y = 150 },
+    { id = "Y", key = "PAD4", x = 360, y = 126, bar = "y" },
+    { id = "X", key = "PAD3", x = 316, y = 170, bar = "x" },
+    { id = "B", key = "PAD2", x = 404, y = 170, bar = "b" },
+    { id = "A", key = "PAD1", x = 360, y = 214, bar = "a" },
+    { id = "L3", key = "PADLSTICK", x = 170, y = 270 },
+    { id = "R3", key = "PADRSTICK", x = 300, y = 270 },
+    { id = "L4", paddle = true, x = 80, y = 372 },
+    { id = "L5", paddle = true, x = 160, y = 372 },
+    { id = "R5", paddle = true, x = 310, y = 372 },
+    { id = "R4", paddle = true, x = 390, y = 372 },
+    -- Touchpads set as buttons (Steam Deck, Steam Controller, Vader Pro...):
+    -- 4 a side (up, right, down, left), each turned on in Gamepad > Display.
+    -- They work like the back paddles (a learned key, the four layers).
+    { id = "TL1", paddle = true, touch = true }, { id = "TL2", paddle = true, touch = true },
+    { id = "TL3", paddle = true, touch = true }, { id = "TL4", paddle = true, touch = true },
+    { id = "TR1", paddle = true, touch = true }, { id = "TR2", paddle = true, touch = true },
+    { id = "TR3", paddle = true, touch = true }, { id = "TR4", paddle = true, touch = true },
+    -- Fork CoolerMgdn: a PlayStation pad's own buttons the game passes on:
+    -- Create (PADSOCIAL, beside the touchpad) and the mic button (PAD5, as
+    -- Forever names it: checked in game). On a PlayStation pad only (ps).
+    { id = "CREATE", key = "PADSOCIAL", x = 200, y = 130, ps = true },
+    { id = "MIC", key = "PAD5", x = 235, y = 190, ps = true },
+}
+M.TOUCH = { "TL1", "TL2", "TL3", "TL4", "TR1", "TR2", "TR3", "TR4" }
+M.BY_ID = {}
+for _, input in ipairs(M.INPUTS) do M.BY_ID[input.id] = input end
+
+-- Gamepad buttons the client reports for back paddles (Xbox Elite, DualSense
+-- Edge...); Steam Input sends keyboard keys instead, learned by pressing
+M.PADDLE_KEYS = { L4 = "PADPADDLE2", R4 = "PADPADDLE1", L5 = "PADPADDLE4", R5 = "PADPADDLE3" }
+
+-- The game's gamepad bar for each layer, and its fixed top face buttons
+M.LAYER_BAR = { [""] = "top", LT = "left", RT = "right", LTRT = "bottom" }
+
+local function settings() return CK.db.settings end
+
+-- Fork CoolerMgdn: the buttons shown as a PlayStation pad's
+function M.PlayStation()
+    return CK.db ~= nil and CK:GlyphStyle() == "playstation"
+end
+
+-- Fork CoolerMgdn, once on a PlayStation pad: the pad's own buttons learned
+-- as touchpad buttons or paddles before they were inputs of their own
+-- (Create learned as TL4: PADSOCIAL) go to those inputs, with what each
+-- layer held; then the paddles and touchpad buttons, which a DualSense
+-- hasn't, are cleared (their keys, places and actions), in every profile
+-- of the account. Asked: "my Create is shown as TL4; I have no paddles".
+local REAL = { PADSOCIAL = "CREATE", PAD5 = "MIC" }
+function M:MigrateDualSense()
+    local s = settings()
+    -- (a DualSense Edge, said in the guide: its back buttons are paddles)
+    if s.forkDualSense or s.dualsenseEdge or not M.PlayStation() then return false end
+    s.forkDualSense = 1
+    local moveTo, gone = {}, {}
+    for _, input in ipairs(M.INPUTS) do
+        if input.paddle then
+            gone[input.id] = true
+            local cfg = s.paddles[input.id]
+            local key = type(cfg) == "table" and cfg.key
+            if key and REAL[key] then moveTo[input.id] = REAL[key] end
+        end
+    end
+    local function fix(t)
+        if type(t) ~= "table" then return end
+        local add = {}
+        for k, v in pairs(t) do
+            local id, layer = type(k) == "string" and k:match("^(%w+):(%a*)$")
+            if id and gone[id] then
+                if moveTo[id] then add[moveTo[id] .. ":" .. layer] = v end
+                t[k] = nil
+            end
+        end
+        for k, v in pairs(add) do
+            if t[k] == nil then t[k] = v end
+        end
+    end
+    fix(s.mapping)
+    fix(s.replaced)
+    -- (the account's own, kept aside while a character's are in use)
+    local shared = CK.Profiles and CK.Profiles.shared
+    if type(shared) == "table" then
+        fix(shared[1])
+        fix(shared[2])
+    end
+    for _, p in pairs(type(ControllerKeyboardDB.profiles) == "table" and ControllerKeyboardDB.profiles or {}) do
+        if type(p) == "table" then
+            if type(p.data) == "table" then fix(p.data.mapping) fix(p.data.replaced) end
+            for _, set in ipairs(type(p.sets) == "table" and p.sets or {}) do
+                if type(set) == "table" and type(set.data) == "table" then fix(set.data.mapping) fix(set.data.replaced) end
+            end
+        end
+    end
+    for id in pairs(gone) do
+        if type(s.paddles[id]) == "table" then wipe(s.paddles[id]) end
+        if type(s.extraPos) == "table" then s.extraPos[id] = nil end
+    end
+    if type(s.touchButtons) == "table" then wipe(s.touchButtons) end
+    return true
+end
+
+function M:Enabled()
+    return CK.db and settings().modules.mapping
+end
+
+-- A touchpad button only once turned on (Gamepad > Display)
+function M:InputEnabled(input)
+    -- Fork CoolerMgdn: Create and the mic on a PlayStation pad only
+    if input and input.ps then return M.PlayStation() end
+    if not (input and input.touch) then return input ~= nil end
+    local on = settings().touchButtons
+    return type(on) == "table" and on[input.id] == true
+end
+
+function M:AnyTouch()
+    for _, id in ipairs(M.TOUCH) do
+        if self:InputEnabled(M.BY_ID[id]) then return true end
+    end
+    return false
+end
+
+function M:InputKey(input)
+    if input.paddle then
+        local cfg = settings().paddles[input.id]
+        return cfg and cfg.key or M.PADDLE_KEYS[input.id]
+    end
+    return input.key
+end
+
+---------------------------------------------------------------------------
+-- Trigger layers: the triggers act as keyboard modifiers when the client's
+-- GamePadEmulateShift / Ctrl / Alt settings name them
+---------------------------------------------------------------------------
+local EMULATE = { { "ALT", "GamePadEmulateAlt" }, { "CTRL", "GamePadEmulateCtrl" }, { "SHIFT", "GamePadEmulateShift" } }
+
+function M:TriggerModifier(button)
+    for _, e in ipairs(EMULATE) do
+        if GetCVar(e[2]) == button then return e[1] end
+    end
+end
+
+-- RT as a modifier too (the game's own gamepad setting, like LT = Shift):
+-- with it, RT + a paddle is a key of its own, so the RT and LT + RT layers
+-- exist for the extra buttons. Takes a free modifier, Alt then Ctrl.
+local FREE = { [""] = true, none = true, NONE = true }
+
+function M:SetTriggerModifier(button, on)
+    if InCombatLockdown() then return CK:BlockedByCombat() end
+    local wrote = false
+    if on then
+        if self:TriggerModifier(button) then return end
+        for _, cvar in ipairs({ "GamePadEmulateAlt", "GamePadEmulateCtrl" }) do
+            if FREE[GetCVar(cvar) or ""] then
+                SetCVar(cvar, button)
+                wrote = true
+                break
+            end
+        end
+    else
+        for _, e in ipairs(EMULATE) do
+            if GetCVar(e[2]) == button then
+                SetCVar(e[2], "none")
+                wrote = true
+            end
+        end
+    end
+    self:Apply()
+    CK.Paddles:Apply()
+    if wrote then self:CheckTriggerModifier(button, on) end
+end
+
+-- The setting written, kept? Checked at once and a moment later (another
+-- addon may put it back on its own change event or a timer). Reported: the
+-- box wouldn't stay ticked, the setting not changed by /console either,
+-- and nothing said why. Said once, in the chat (and the window's toast).
+function M:CheckTriggerModifier(button, on)
+    local name = button == "PADLTRIGGER" and "LT" or "RT"
+    local function kept() return (self:TriggerModifier(button) ~= nil) == (on and true or false) end
+    local function refused()
+        CK:Print(L.TRIGGER_MOD_REFUSED, name)
+        if CK.Config and CK.Config:IsOpen() then CK.Config:Toast(format(L.TOAST_TRIGGER_MOD_REFUSED, name), true) end
+    end
+    if not kept() then return refused() end
+    C_Timer.After(1, function()
+        if not kept() then refused() end
+    end)
+end
+
+function M:CanBeModifier(button)
+    if self:TriggerModifier(button) then return true end
+    return FREE[GetCVar("GamePadEmulateAlt") or ""] or FREE[GetCVar("GamePadEmulateCtrl") or ""] or false
+end
+
+-- The modifiers a key comes with while a layer's triggers are held: those
+-- of the triggers that are modifiers ("SHIFT-"...)
+function M:ArrivalPrefix(layer)
+    local held = {}
+    for _, t in ipairs({ { "LT", "PADLTRIGGER" }, { "RT", "PADRTRIGGER" } }) do
+        local mod = layer:find(t[1], 1, true) and self:TriggerModifier(t[2])
+        if mod then held[mod] = true end
+    end
+    local prefix = ""
+    for _, e in ipairs(EMULATE) do
+        if held[e[1]] then prefix = prefix .. e[1] .. "-" end
+    end
+    return prefix
+end
+
+-- Key name prefix of a layer, nil when a trigger of the layer is not a
+-- modifier (the key is then the same as without it)
+function M:LayerPrefix(layer)
+    if layer:find("LT", 1, true) and not self:TriggerModifier("PADLTRIGGER") then return nil end
+    if layer:find("RT", 1, true) and not self:TriggerModifier("PADRTRIGGER") then return nil end
+    return self:ArrivalPrefix(layer)
+end
+
+-- The layers whose key is the same as this layer's, the one without the
+-- triggers that are no modifier first
+function M:SharedLayers(layer)
+    local prefix, list = self:ArrivalPrefix(layer), {}
+    for _, l in ipairs(M.LAYERS) do
+        if self:ArrivalPrefix(l) == prefix then list[#list + 1] = l end
+    end
+    return list
+end
+
+function M:Combo(input, layer)
+    local key, prefix = self:InputKey(input), self:LayerPrefix(layer)
+    return key and prefix and (prefix .. key)
+end
+
+---------------------------------------------------------------------------
+-- What the game does with an input (nil: free)
+---------------------------------------------------------------------------
+M.bound = {}    -- combo -> what we bound there
+M.taken = {}    -- combo -> what we bound there over the game (replaced buttons)
+M.padRouted = {} -- input id -> its keys go to its router (ApplyPad)
+
+function M:NativeBinding(combo)
+    local action = GetBindingAction(combo, true)
+    if action == self.bound[combo] or action == self.taken[combo]
+        or (action and action:find("^CLICK ControllerKeyboardConfigPad")) then
+        action = GetBindingAction(combo, false)
+    end
+    if action and action ~= "" then return action end
+    if C_KeyBindings and C_KeyBindings.GetBindingByKey and Enum and Enum.BindingContext then
+        local ok, context = pcall(C_KeyBindings.GetBindingByKey, combo, Enum.BindingContext.GamepadModeInGameCore)
+        if ok and type(context) == "string" and context ~= "" then return context end
+    end
+end
+
+-- The game's gamepad bar button for an input and a layer
+function M:NativeBarButton(input, layer)
+    if not input.bar then return end
+    return CK.Paddles:NativeButton(self:BarAction(input, layer))
+end
+
+-- "bar:right:a": the game's bar button of an input in a layer
+function M:BarAction(input, layer)
+    return input.bar and ("bar:" .. M.LAYER_BAR[layer] .. ":" .. input.bar) or nil
+end
+
+-- The one shown now: in a stance (stealth, a form), the stance bar's
+function M:LiveBarButton(input, layer)
+    if not input.bar then return end
+    return CK.Paddles:LiveButton(self:BarAction(input, layer))
+end
+
+-- A press on the game's bar button, as a macro: in a stance, the stance
+-- bar's button where it takes that bar (decided on the press, in combat
+-- too), else the bar's own. For a character with no stance or form, nil:
+-- its button is clicked as before. [bonusbar] alone is false in WoW
+-- Forever, even in stealth (checked in game: [bonusbar:1] true): the bonus
+-- bars by number. The relays decide it themselves (RELAY_SLOT).
+function M:StanceMacro(barAction)
+    local P = CK.Paddles
+    if not P:HasStances() then return nil end
+    local native, stance = P:NativeButton(barAction), P:StanceButton(barAction)
+    local nativeName, stanceName = native and native:GetName(), stance and stance:GetName()
+    if not (nativeName and stanceName) then return nil end
+    return "/click [bonusbar:1/2/3/4/5] " .. stanceName .. " LeftButton true; " .. nativeName .. " LeftButton true"
+end
+
+function M:BarMacro(barAction)
+    local stance = self:StanceMacro(barAction)
+    if stance then return stance end
+    local native = CK.Paddles:NativeButton(barAction)
+    local name = native and native:GetName()
+    return name and ("/click " .. name .. " LeftButton true") or nil
+end
+
+local FIXED_FACE = { a = "JUMP", x = "INTERACT", b = "BACK", y = "INSPECT" }
+-- The game's own pictures for its fixed functions
+local FIXED_ICON = {
+    JUMP = { atlas = "gamepad-ability-icon-jump" },
+    INTERACT = { texture = "Interface\\Cursor\\Interact" },
+    BACK = { atlas = "128-redbutton-exit" },
+    INSPECT = { atlas = "crosshair_inspect_32" },
+}
+
+-- Label and icon of the game's own function, for the mapping page (icons:
+-- see CK.Paddles.SetIcon)
+function M:NativeInfo(input, layer)
+    if input.layer then
+        return input.id == "LT" and L.NAT_LAYER_LEFT or L.NAT_LAYER_RIGHT, { glyph = input.id }
+    end
+    if layer == "" and FIXED_FACE[input.bar] then
+        return L["NAT_" .. FIXED_FACE[input.bar]], FIXED_ICON[FIXED_FACE[input.bar]]
+    end
+    local native = self:LiveBarButton(input, layer)
+    if native then
+        local slot = native.action
+        local name = slot and CK.Paddles.SlotName(slot)
+        local icon = slot and CK.Paddles.SlotTexture(slot)
+        return name or L.MAP_EMPTY_SLOT, icon, true
+    end
+    if input.id == "LB" then
+        return layer == "" and L.NAT_TARGET_FRIEND or L.MAP_GAME, { atlas = "gamepad-targeting-friendly" }
+    end
+    if input.id == "RB" then
+        return layer == "" and L.NAT_TARGET_ENEMY or L.MAP_GAME, { atlas = "gamepad-targeting-hostile" }
+    end
+    if layer == "" and input.id == "START" then return self:NativeCommandInfo("OPENRADIAL") end
+    if layer == "" and input.id == "SELECT" then return self:NativeCommandInfo("TOGGLEUIFOCUS") end
+    local combo = self:Combo(input, layer)
+    local action = combo and self:NativeBinding(combo)
+    if not action then return nil end
+    return self:NativeCommandInfo(action)
+end
+
+---------------------------------------------------------------------------
+-- The game's gamepad bar slots (D-pad, A / B / X / Y in each layer): what
+-- they hold is changed the way the game's own action bar editor does it
+-- (picked up and placed in the slot, out of combat). The button itself stays
+-- the game's. The fixed face buttons alone (jump, interact...) are no slot.
+---------------------------------------------------------------------------
+function M:NativeSlot(input, layer)
+    if not input.bar or (layer == "" and FIXED_FACE[input.bar]) then return nil end
+    local native = self:LiveBarButton(input, layer)
+    local slot = native and native.action
+    if type(slot) == "number" and slot > 0 then return slot end
+end
+
+-- "spell:133" for what a slot holds
+function M:SlotAction(slot)
+    if not (slot and C_ActionBar.HasAction(slot)) then return nil end
+    local kind, id = GetActionInfo(slot)
+    if kind == "spell" then return "spell:" .. id end
+    if kind == "item" then return "item:" .. id end
+    if kind == "macro" then
+        local name = GetActionText and GetActionText(slot) or (GetMacroInfo and (GetMacroInfo(id)))
+        return name and ("macro:" .. name)
+    end
+end
+
+-- What the game itself won't take off its gamepad bars (the hunter's aspects,
+-- pet actions while the pet has its bar): its own message, else nil
+function M:SlotKept(slot)
+    local util = GamepadActionBarBindingUtil
+    if not (slot and util and util.GetUnbindErrorMessage and C_ActionBar.HasAction(slot)) then return nil end
+    local ok, message = pcall(util.GetUnbindErrorMessage, { GetActionInfo(slot) })
+    return ok and message or nil
+end
+
+local function refuseKept(slot)
+    local message = M:SlotKept(slot)
+    if message and UIErrorsFrame then UIErrorsFrame:AddMessage(message, 1, 0.1, 0.1) end
+    return message ~= nil
+end
+
+function M:PlaceInSlot(slot, action)
+    if CK:BlockedByCombat() then return false end
+    -- What was there would be lost
+    if refuseKept(slot) then return false end
+    local kind, value = (action or ""):match("^(%a+):(.+)$")
+    ClearCursor()
+    if kind == "spell" then
+        local pickup = C_Spell and C_Spell.PickupSpell or PickupSpell
+        pickup(tonumber(value))
+    elseif kind == "item" then
+        local pickup = C_Item and C_Item.PickupItem or PickupItem
+        pickup(tonumber(value))
+    elseif kind == "macro" then
+        PickupMacro(value)
+    end
+    if not GetCursorInfo() then return false end
+    PlaceAction(slot)
+    -- What was there comes back on the cursor: let it go
+    ClearCursor()
+    return true
+end
+
+function M:ClearSlot(slot)
+    if CK:BlockedByCombat() or refuseKept(slot) then return end
+    ClearCursor()
+    PickupAction(slot)
+    ClearCursor()
+end
+
+-- Start and Select are the game's system buttons (its radial menu, the
+-- interface's focus): left to it in every layer, never bound or replaced
+-- (reported: RT + Start took a spell that never ran)
+M.SYSTEM = { START = true, SELECT = true }
+
+-- What an older version had put on Start / Select, removed at load: said
+-- once in the chat, so the player can put it on another button
+function M:ReportSystemRemoved()
+    local removed = CK.removedSystem
+    CK.removedSystem = nil
+    if not removed then return end
+    local parts = {}
+    for _, e in pairs(removed) do
+        local id, layer = e.key:match("^(%u+):(%a*)$")
+        local button = id == "START" and "Start" or "Select"
+        local where = layer and layer ~= "" and ((layer == "LTRT" and "LT + RT" or layer) .. " + " .. button) or button
+        parts[#parts + 1] = where .. " (" .. tostring(self:ActionName(e.action) or e.action) .. ")"
+    end
+    if #parts == 0 then return end
+    table.sort(parts)
+    CK:Print(L.SYSTEM_REMOVED, table.concat(parts, ", "))
+end
+
+-- "Nothing": a button of the game's that does nothing in a layer (L3 freed
+-- from the game's autorun, so its trigger layers can work)
+M.NOTHING = "none:none"
+local NOOP_BINDING = "CONTROLLERKEYBOARD_NOOP"
+
+-- L3 / R3 / LB / RB alone keep the game's function (autorun, ping, its
+-- targeting): the game then takes them with a trigger held too, the pad
+-- sending the button's key without the trigger's modifier (checked in
+-- game: a binding of our own on Shift + L3, even with priority, never ran;
+-- the character ran; a spell on LT + RB never ran either). Their trigger
+-- layers (for LB / RB, the crossed ones: RT + LB, LT + RB) work once the
+-- button alone holds something of the player's, or Nothing: the key is
+-- then ours, read with the triggers held.
+local HELD_ALONE = { L3 = true, R3 = true, LB = true, RB = true }
+
+function M:StickHeld(input)
+    if not HELD_ALONE[input.id] or self:GetReplaced(input.id, "") then return false end
+    local key = self:InputKey(input)
+    return key and self:NativeBinding(key) and true or false
+end
+
+-- A game function on a key (a binding): it can't be run by a router, and
+-- with a trigger held the pad sends the button without the trigger
+local function bound(action)
+    return type(action) == "string" and not M.Routable(action) and action ~= M.NOTHING
+        and not action:find("^bar:")
+end
+M.IsBoundAction = bound
+
+-- The same for a face or D-pad button the player gave a game function alone
+-- ("Target allies" on X): that function takes its trigger layers too
+-- (reported: RT + X targeted an ally instead of casting the right bar's
+-- spell). They work again once X alone holds a spell, a wheel or Nothing.
+-- L3 / R3 too (reported: Jump on L3 alone, a spell on LT + L3 jumped, Autorun
+-- on R3 alone, Quick phrases on LT + R3 ran Autorun): a game function the
+-- player put there alone, replacing the game's or on a free stick
+local STICK = { L3 = true, R3 = true }
+
+function M:CommandAlone(input)
+    if STICK[input.id] then
+        return bound(self:GetReplaced(input.id, "") or self:Get(input.id, ""))
+    end
+    if not (input.bar and self:ReplaceOn() and self:OwnKeys()) then return false end
+    return bound(self:GetReplaced(input.id, ""))
+end
+
+-- "free", "native", "slot", "locked" (layer unavailable) for an input
+function M:State(input, layer)
+    if input.layer or M.SYSTEM[input.id] then return "native" end
+    if layer ~= "" and (self:StickHeld(input) or self:CommandAlone(input)) then return "locked" end
+    -- The bars' buttons, and LB / RB (targeting, and the game's class
+    -- actions on LT + LB / RT + RB) always belong to the game, in every
+    -- layer: the game switches its bars itself, triggers modifiers or not
+    if input.bar then return self:NativeSlot(input, layer) and "slot" or "native" end
+    if input.id == "LB" or input.id == "RB" then return "native" end
+    -- The back paddles have every layer (see "Back paddles" below), but a
+    -- game function on a shared key takes it in all its layers
+    if input.paddle then
+        if not self:InputKey(input) then return "locked" end
+        local base = self:SharedLayers(layer)[1]
+        local baseAction = layer ~= base and self:Get(input.id, base)
+        if baseAction and not M.Routable(baseAction) then return "locked" end
+        return "free"
+    end
+    local combo = self:Combo(input, layer)
+    if not combo then return "locked" end
+    if self.snapshot and self.snapshot[combo] ~= nil then
+        return self.snapshot[combo] and "native" or "free"
+    end
+    return self:NativeBinding(combo) and "native" or "free"
+end
+
+-- Free / native state of every combo, taken before the window binds the pad
+function M:TakeSnapshot()
+    self:Release()
+    self.snapshot = nil
+    local snapshot = {}
+    for _, input in ipairs(M.INPUTS) do
+        for _, layer in ipairs(M.LAYERS) do
+            local combo = self:Combo(input, layer)
+            if combo then snapshot[combo] = self:NativeBinding(combo) ~= nil end
+        end
+    end
+    self.snapshot = snapshot
+end
+
+function M:DropSnapshot()
+    self.snapshot = nil
+end
+
+---------------------------------------------------------------------------
+-- Assignments: settings.mapping["L3:LT"] = "cmd:TOGGLERUN" | "spell:133" |
+-- "item:5512" | "macro:Name" | "bar:bottom:a" | "wheel:consumables" |
+-- "wheel:phrases" (the quick phrases window) | "wheel:minimap" (the
+-- minimap's labels)
+---------------------------------------------------------------------------
+function M:Get(inputId, layer)
+    return settings().mapping[inputId .. ":" .. layer]
+end
+
+function M:Set(inputId, layer, action)
+    if M.SYSTEM[inputId] then return end
+    settings().mapping[inputId .. ":" .. layer] = action
+    -- Fork CoolerMgdn: Create / the mic keep one action per layer: the one
+    -- saved among the replaced buttons goes (found: L2 + R2 + Create cleared
+    -- on the Gamepad tab, the hearthstone kept running from there)
+    local input = M.BY_ID[inputId]
+    if input and input.ps then settings().replaced[inputId .. ":" .. layer] = nil end
+    self:Apply()
+    CK.Paddles:Apply()
+end
+
+---------------------------------------------------------------------------
+-- Fork CoolerMgdn: hold (a long press, HoldClock.lua). Each button, in each
+-- layer, can have a second action run when it is held about half a second
+-- and let go; a quick press then runs the button's own on its release.
+-- Saved with the others: settings.mapping["A:HLT"] (the layer named "H" ..
+-- layer), so the profiles keep them too. Spells, items, macros, wheels and
+-- the game's bar buttons: a router runs them (a game function, a key
+-- binding, can't be run by one).
+---------------------------------------------------------------------------
+M.HOLD = "H"
+
+function M:GetHold(inputId, layer)
+    return settings().mapping[inputId .. ":" .. M.HOLD .. layer]
+end
+
+function M:SetHold(inputId, layer, action)
+    if action == M.NOTHING then action = nil end
+    settings().mapping[inputId .. ":" .. M.HOLD .. layer] = action
+    self:Apply()
+    CK.Paddles:Apply()
+end
+
+function M:HasHold(input)
+    for _, layer in ipairs(M.LAYERS) do
+        if self:GetHold(input.id, layer) then return true end
+    end
+    return false
+end
+
+---------------------------------------------------------------------------
+-- Fork CoolerMgdn (asked): a double press, saved as settings.mapping["A:DLT"]
+-- (the layer named "D" .. layer). The first press runs the button's own at
+-- once: what the secure code runs later, from its clock and not from a
+-- press, can't cast a spell or use an item. A second press soon after
+-- (HoldClock.lua: 0.2 - 0.4 s) runs this instead of the button's own. The
+-- same buttons as a hold (run by a router), the same things on it.
+---------------------------------------------------------------------------
+M.DOUBLE = "D"
+
+function M:GetDouble(inputId, layer)
+    return settings().mapping[inputId .. ":" .. M.DOUBLE .. layer]
+end
+
+function M:SetDouble(inputId, layer, action)
+    if action == M.NOTHING then action = nil end
+    settings().mapping[inputId .. ":" .. M.DOUBLE .. layer] = action
+    self:Apply()
+    CK.Paddles:Apply()
+end
+
+function M:HasDouble(input)
+    for _, layer in ipairs(M.LAYERS) do
+        if self:GetDouble(input.id, layer) then return true end
+    end
+    return false
+end
+
+-- A layer saved under a hold's or a double press's name ("HLT", "DRT")
+function M.ExtraLayer(layer)
+    local first = type(layer) == "string" and layer:sub(1, 1) or ""
+    return first == M.HOLD or first == M.DOUBLE
+end
+
+-- Why a button in a layer can't have a double press, or nil: a hold's
+-- reasons, said for a double press
+function M:DoubleBlocked(input, layer)
+    local why = self:HoldBlocked(input, layer)
+    if not why then return nil end
+    if why == L.MAP_HOLD_NO or why == L.MAP_HOLD_MOUSE then return L.MAP_DBL_NO end
+    if why == L.MAP_HOLD_COMMAND then return L.MAP_DBL_COMMAND end
+    return why
+end
+
+-- What a hold can be: run by a router
+function M.HoldAction(action)
+    return M.Routable(action) or (type(action) == "string" and action:find("^bar:") ~= nil
+        and CK.Paddles:NativeButton(action) ~= nil)
+end
+
+-- Why a button in a layer can't have a hold, or nil
+function M:HoldBlocked(input, layer)
+    if not input then return L.MAP_HOLD_NO end
+    if not self:Enabled() then return L.MAP_MODULE_OFF end
+    if input.layer or M.SYSTEM[input.id] then return L.MAP_HOLD_NO end
+    if (input.id == "LB" or input.id == "RB") and layer ~= "" and layer ~= CROSSED[input.id] then
+        return L.MAP_KEPT_CLASS
+    end
+    local key = self:InputKey(input)
+    if not key then return input.paddle and L.MAP_PADDLE_NO_KEY or L.MAP_HOLD_NO end
+    -- The mic: its long press is the touchpad's mouse mode
+    local T = CK.Touchpad
+    if T and T.HoldsKey and T.HoldsKey(key) then return L.MAP_HOLD_MOUSE end
+    if input.paddle then
+        local base = self:SharedLayers(layer)[1]
+        local tap = self:Get(input.id, base)
+        if tap and not M.Routable(tap) and tap ~= M.NOTHING then return L.MAP_HOLD_COMMAND end
+        return nil
+    end
+    -- A layer a game function (a key binding) runs: no router on the button
+    if not self:PadTargets(input, true) then return L.MAP_HOLD_COMMAND end
+    if self:State(input, layer) == "locked" then return L.MAP_HOLD_NO end
+    return nil
+end
+
+---------------------------------------------------------------------------
+-- The game's buttons, replaced: A, B, X, Y, the D-pad, LB / RB, Start,
+-- Select... take any function, bound over the game's with priority.
+-- settings.replaced["A:"] = action; the Gamepad tab's Restore button empties
+-- it. Each layer needs a key of its own, so both triggers are modifiers.
+-- The other layers of a replaced button get what the game does there, bound
+-- the same way: a key with no binding of its own would fall back to ours
+-- (the game takes the key without its modifiers). The game's menus bind
+-- their keys over ours; ours are also taken away while one of them has the
+-- focus (out of combat). A slot of the game's bar keeps what it holds,
+-- under our function's picture, and gets it back when the button does.
+---------------------------------------------------------------------------
+local TRIGGERS = { "PADLTRIGGER", "PADRTRIGGER" }
+
+function M:ReplaceOn()
+    return self:Enabled() or false
+end
+
+-- How many of the game's buttons are replaced
+function M:ReplacedCount()
+    local n = 0
+    for _ in pairs(settings().replaced) do n = n + 1 end
+    return n
+end
+
+-- Every replaced button back to the game's own binding (what the player put
+-- in the game's slots, on the free buttons and paddles stays)
+function M:RestoreGameButtons()
+    wipe(settings().replaced)
+    self:Apply()
+    CK.Paddles:Apply()
+end
+
+-- The game's own: never the triggers (its bars), LB / RB alone only (with
+-- a trigger, its class and pet actions read the buttons themselves)
+-- LB / RB: alone, and LT + RB / RT + LB, which the game leaves to the
+-- targeting (its class actions are LT + LB and RT + RB, read from the keys
+-- held: they stay the game's)
+local CROSSED = { LB = "RT", RB = "LT" }
+M.CROSSED = CROSSED
+
+function M:Replaceable(input, layer)
+    if not self:ReplaceOn() or input.layer or input.paddle or M.SYSTEM[input.id] then return false end
+    if (input.id == "LB" or input.id == "RB") and layer ~= "" and layer ~= CROSSED[input.id] then return false end
+    local state = self:State(input, layer)
+    return state == "native" or state == "slot"
+end
+
+-- Every layer has a key of its own: both triggers are modifiers
+function M:OwnKeys()
+    return self:TriggerModifier("PADLTRIGGER") ~= nil and self:TriggerModifier("PADRTRIGGER") ~= nil
+end
+
+-- Enough free modifiers in the game's gamepad settings for that
+function M:CanOwnKeys()
+    local need, free = 0, 0
+    for _, t in ipairs(TRIGGERS) do
+        if not self:TriggerModifier(t) then need = need + 1 end
+    end
+    for _, cvar in ipairs({ "GamePadEmulateAlt", "GamePadEmulateCtrl" }) do
+        if FREE[GetCVar(cvar) or ""] then free = free + 1 end
+    end
+    return free >= need
+end
+
+function M:GetReplaced(inputId, layer)
+    return self:ReplaceOn() and settings().replaced[inputId .. ":" .. layer] or nil
+end
+
+-- Bound now: the option on, the button the game's, a key of its own
+function M:ReplacedActive(input, layer)
+    return self:GetReplaced(input.id, layer) ~= nil and self:OwnKeys() and self:Replaceable(input, layer)
+end
+
+-- What the game itself runs on an input: its bar button, else its binding
+function M:NativeAction(input, layer)
+    if input.bar then return "bar:" .. M.LAYER_BAR[layer] .. ":" .. input.bar end
+    local combo = self:Combo(input, layer)
+    local command = combo and self:NativeBinding(combo)
+    return command and not command:find("^CLICK ") and ("cmd:" .. command) or nil
+end
+
+function M:SetReplaced(inputId, layer, action)
+    if M.SYSTEM[inputId] then return end
+    -- The game's own function chosen: the button given back to it
+    local input = M.BY_ID[inputId]
+    if action and input and action == self:NativeAction(input, layer) then action = nil end
+    settings().replaced[inputId .. ":" .. layer] = action
+    -- Fork CoolerMgdn: the same the other way (see M:Set)
+    if input and input.ps then settings().mapping[inputId .. ":" .. layer] = nil end
+    if action then
+        for _, t in ipairs(TRIGGERS) do
+            if not self:TriggerModifier(t) then self:SetTriggerModifier(t, true) end
+        end
+    end
+    self:Apply()
+    CK.Paddles:Apply()
+end
+
+---------------------------------------------------------------------------
+-- Back paddles: four layers, triggers modifiers or not. A trigger that is
+-- no keyboard modifier (RT, unless the option makes it one) changes nothing
+-- in the key a paddle sends: L4 and RT + L4 are one key, which the layers
+-- share. That key then goes to a secure button that picks the layer when it
+-- is pressed, from the triggers held (the game lets secure code read the
+-- gamepad), and runs that layer's spell, item or macro. A game function is
+-- a key binding: it needs the key to itself, all its layers.
+---------------------------------------------------------------------------
+local ROUTABLE = { spell = true, item = true, macro = true, wheel = true, auto = true }
+
+function M.Routable(action)
+    return type(action) == "string" and ROUTABLE[action:match("^(%a+):") or ""] or false
+end
+
+-- What an input runs in a layer: its own action, else (a shared key) the
+-- one of the layer the key belongs to
+function M:EffectiveAction(input, layer)
+    local base = self:SharedLayers(layer)[1]
+    local baseAction = self:Get(input.id, base)
+    if not input.paddle or (baseAction and not M.Routable(baseAction)) then return baseAction end
+    local own = self:Get(input.id, layer)
+    -- Each layer its own: a layer with nothing runs nothing
+    if layer ~= base and not M.Routable(own) then return nil end
+    return own
+end
+
+-- A game function left on a layer that now shares its key (RT no longer a
+-- modifier): kept, not bound
+function M:Inactive(input, layer)
+    local action = input.paddle and self:Get(input.id, layer)
+    return action and not M.Routable(action) and layer ~= self:SharedLayers(layer)[1] or false
+end
+
+-- The lists the mapping window offers for a paddle in a layer (a shared
+-- key: what its router runs, spells, party spells, items and macros)
+function M:PaddleTabs(input, layer)
+    local shared = self:SharedLayers(layer)
+    if #shared == 1 then return M.TABS end
+    if layer == shared[1] then
+        for i = 2, #shared do
+            if self:Get(input.id, shared[i]) then return M.SHARED_TABS end
+        end
+        return M.TABS
+    end
+    return M.SHARED_TABS
+end
+
+---------------------------------------------------------------------------
+-- Actions: names, icons
+---------------------------------------------------------------------------
+local COMMAND_ICONS = {
+    CONTROLLERKEYBOARD_TOGGLE = "Interface\\ChatFrame\\UI-ChatIcon-Chat-Up",
+    CONTROLLERKEYBOARD_MAP = "Interface\\Icons\\INV_Gizmo_02",
+    CONTROLLERKEYBOARD_CONFIG = "Interface\\Icons\\INV_Gizmo_02",
+    TOGGLEAUTORUN = { atlas = "Ping_Marker_Icon_OnMyWay", glyph = "LS" },
+    TOGGLERUN = "Interface\\Icons\\Ability_Tracking",
+    JUMP = { atlas = "gamepad-ability-icon-jump", glyph = "A" },
+    TOGGLEWORLDMAP = "Interface\\Icons\\INV_Misc_Map02",
+    OPENALLBAGS = "Interface\\Icons\\INV_Misc_Bag_08",
+    TOGGLEBACKPACK = "Interface\\Icons\\INV_Misc_Bag_08",
+    TOGGLECHARACTER0 = "Interface\\Icons\\INV_Chest_Cloth_17",
+    TOGGLESPELLBOOK = "Interface\\Icons\\INV_Misc_Book_09",
+    TOGGLETALENTS = "Interface\\Icons\\Ability_Marksmanship",
+    TOGGLEQUESTLOG = "Interface\\Icons\\INV_Misc_Book_08",
+    TOGGLESOCIAL = "Interface\\Icons\\INV_Letter_15",
+    TOGGLEGAMEMENU = "Interface\\Icons\\INV_Misc_Gear_01",
+    TARGETNEARESTENEMY = "Interface\\Icons\\Ability_Hunter_SniperShot",
+    TARGETNEARESTFRIEND = "Interface\\Icons\\Spell_Holy_Heal",
+    INTERACTTARGET = "Interface\\Icons\\INV_Misc_Gear_01",
+    ASSISTTARGET = "Interface\\Icons\\Ability_Hunter_SniperShot",
+    FOLLOWTARGET = "Interface\\Icons\\Ability_Tracking",
+    TOGGLESHEATH = "Interface\\Icons\\INV_Sword_04",
+    SITORSTAND = "Interface\\Icons\\Spell_Nature_Sleep",
+    TOGGLEUI = "Interface\\Icons\\INV_Misc_Spyglass_03",
+    SCREENSHOT = "Interface\\Icons\\INV_Misc_Spyglass_03",
+}
+local COMMAND_ICON = "Interface\\Icons\\INV_Misc_Key_03"
+
+-- The game's own gamepad bindings have no name of their own
+local NATIVE_COMMANDS = {
+    OPENRADIAL = { "NAT_START", "Interface\\Icons\\INV_Misc_Gear_01" },
+    TOGGLEUIFOCUS = { "NAT_SELECT", "Interface\\Icons\\INV_Misc_Spyglass_02" },
+    TOGGLEPINGSYSTEM = { "NAT_PING", { atlas = "Ping_Marker_Icon_Assist", glyph = "RS" } },
+    TOGGLEPINGLISTENER = { "NAT_PING", { atlas = "Ping_Marker_Icon_Assist", glyph = "RS" } },
+    -- Held: the game's targeting (LB / RB)
+    GAMEPADLEFTTARGETMODIFIER = { "NAT_TARGET_FRIEND", { atlas = "gamepad-targeting-friendly" }, hold = true },
+    GAMEPADRIGHTTARGETMODIFIER = { "NAT_TARGET_ENEMY", { atlas = "gamepad-targeting-hostile" }, hold = true },
+}
+
+-- The game's own gamepad functions, for any free input: its four fixed
+-- buttons (pressed: their own behaviour, the smart interact...) and its
+-- gamepad key bindings. Not its left / right bar modifiers: the game checks
+-- which key holds them.
+M.PAD_FUNCTIONS = {
+    "bar:top:a", "bar:top:b", "bar:top:x", "bar:top:y",
+    "cmd:OPENRADIAL", "cmd:TOGGLEUIFOCUS", "cmd:TOGGLEPINGSYSTEM",
+    "cmd:GAMEPADLEFTTARGETMODIFIER", "cmd:GAMEPADRIGHTTARGETMODIFIER",
+}
+
+-- Name and icon of a binding of the game's (a command, or a click on one
+-- of its gamepad buttons)
+function M:NativeCommandInfo(action)
+    local known = NATIVE_COMMANDS[action] or (action:find("^TOGGLEPING") and NATIVE_COMMANDS.TOGGLEPINGSYSTEM)
+    if known then return L[known[1]], known[2] end
+    if action:find("^CLICK ") then return L.MAP_GAME end
+    local name = CK.Paddles:CommandName(action)
+    if name == action then name = L.MAP_GAME end
+    return name, COMMAND_ICONS[action]
+end
+
+-- Game functions offered first, the most missed on a gamepad
+M.COMMON = {
+    "TOGGLERUN", "TOGGLEAUTORUN", "TOGGLEGAMEMENU", "TOGGLEWORLDMAP", "OPENALLBAGS",
+    "TOGGLECHARACTER0", "TOGGLESPELLBOOK", "TOGGLETALENTS", "TOGGLEQUESTLOG", "TOGGLESOCIAL",
+    "CONTROLLERKEYBOARD_TOGGLE", "CONTROLLERKEYBOARD_CONFIG", "TARGETNEARESTENEMY", "ASSISTTARGET", "FOLLOWTARGET",
+    "SITORSTAND", "TOGGLESHEATH", "TOGGLEUI", "SCREENSHOT",
+}
+
+-- "Name (Rank 3)": the spell book holds each rank of a spell
+function M.SpellName(id, rank)
+    local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(id)
+    if not name then return nil end
+    rank = rank or (C_Spell.GetSpellSubtext and C_Spell.GetSpellSubtext(id))
+    if rank and rank ~= "" then name = name .. " |cff9d9a8c(" .. rank .. ")|r" end
+    return name
+end
+
+-- What a secure button casts for a spell: its name, with its rank when the
+-- spell book lists ranks ("Name(Rank 3)", the rank chosen stays the one
+-- cast); its ID only while the name is not known. Some spells (Ghost Wolf,
+-- shapeshift forms) don't cast by ID, a macro casting them by name did.
+function M.SpellCast(id)
+    id = tonumber(id)
+    local name = id and C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(id)
+    if not name then return id end
+    local sub = C_Spell.GetSpellSubtext and C_Spell.GetSpellSubtext(id)
+    if type(sub) == "string" and sub:find("%d") then return name .. "(" .. sub .. ")" end
+    return name
+end
+
+-- A spell for the party's wheel: one the game says helps (heals, buffs),
+-- with a range (not one on yourself only). The game not telling: kept
+function M.ForAllies(id)
+    local helpful = C_Spell and C_Spell.IsSpellHelpful and C_Spell.IsSpellHelpful(id)
+    if helpful == false then return false end
+    local info = C_Spell and C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(id)
+    if type(info) == "table" and info.maxRange == 0 then return false end
+    return true
+end
+
+-- A party spell's action ("wheel:party:<spell ID>"): its spell's ID
+function M.PartySpell(action)
+    return type(action) == "string" and tonumber(action:match("^wheel:party:(%d+)$")) or nil
+end
+
+-- A party spell on a button (this character's): its wheel needs the
+-- stick's direction keys in combat
+function M:HasPartySpells()
+    for _, list in ipairs({ settings().mapping, settings().replaced }) do
+        for _, action in pairs(list or {}) do
+            if M.PartySpell(action) then return true end
+        end
+    end
+    return false
+end
+
+function M:ActionName(action)
+    if not action then return nil end
+    if action == M.NOTHING then return L.MAP_NO_ACTION end
+    local kind, value = action:match("^(%a+):(.+)$")
+    local fixed = FIXED_FACE[action:match("^bar:top:(%a)$") or ""]
+    if fixed then return L["NAT_" .. fixed] end
+    if kind == "cmd" and NATIVE_COMMANDS[value] then
+        local native = NATIVE_COMMANDS[value]
+        return L[native[1]] .. (native.hold and L.MAP_HOLD or "")
+    end
+    if kind == "cmd" then
+        return CK.Paddles:CommandName(value)
+    elseif kind == "spell" then
+        return M.SpellName(tonumber(value)) or value
+    elseif kind == "item" then
+        local id = tonumber(value)
+        return C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(id) or value
+    elseif kind == "macro" then
+        return value
+    elseif kind == "bar" then
+        return CK.Paddles:ActionLabel(action)
+    elseif kind == "auto" then
+        return CK.Auto and CK.Auto:Name(value) or value
+    elseif kind == "wheel" then
+        local n = tonumber(value)
+        if value == "class" then return L.CLASS_WHEEL_NAME end
+        if value == "marks" then return L.MARK_WHEEL_NAME end
+        if value == "phrases" then return L.PHRASES_NAME end
+        if value == "minimap" then return L.MML_NAME end
+        local spell = M.PartySpell(action)
+        if spell then return format(L.PARTY_ACTION, M.SpellName(spell) or tostring(spell)) end
+        if value == "usable" then return L.USABLE_WHEEL_NAME end
+        if not n then return L.WHEEL_NAME end
+        return CK.MyWheels and CK.MyWheels:Name(n) or L.MYWHEEL_GONE
+    end
+end
+
+function M:ActionIcon(action)
+    if not action then return nil end
+    if action == M.NOTHING then return "Interface\\Buttons\\UI-GroupLoot-Pass-Up" end
+    local kind, value = action:match("^(%a+):(.+)$")
+    local fixed = FIXED_FACE[action:match("^bar:top:(%a)$") or ""]
+    if fixed then return FIXED_ICON[fixed] end
+    if kind == "cmd" and NATIVE_COMMANDS[value] then return NATIVE_COMMANDS[value][2] end
+    if kind == "cmd" then
+        return COMMAND_ICONS[value] or COMMAND_ICON
+    elseif kind == "spell" then
+        return C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(tonumber(value))
+    elseif kind == "item" then
+        return C_Item and C_Item.GetItemIconByID and C_Item.GetItemIconByID(tonumber(value))
+    elseif kind == "macro" then
+        local _, icon = GetMacroInfo(value)
+        return icon
+    elseif kind == "bar" then
+        return CK.Paddles:ActionIcon(action)
+    elseif kind == "auto" then
+        return CK.Auto and CK.Auto:Icon(value)
+    elseif kind == "wheel" then
+        local n = tonumber(value)
+        if value == "class" then return CK.ClassWheels and CK.ClassWheels:ClassIcon() end
+        if value == "marks" then return CK.ClassWheels and CK.ClassWheels.MARK_ICON end
+        if value == "phrases" then return CK.Phrases and CK.Phrases.ICON end
+        if value == "minimap" then return CK.MinimapLabels and CK.MinimapLabels.ICON end
+        if value == "usable" then return M.USABLE_ICON end
+        local spell = M.PartySpell(action)
+        if spell then return C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(spell) end
+        return n and CK.MyWheels and CK.MyWheels:Icon(n) or M.WHEEL_ICON
+    end
+end
+
+---------------------------------------------------------------------------
+-- Catalogue for the mapping window: { header = "..." } or
+-- { action = "...", name = "...", icon = ... }
+---------------------------------------------------------------------------
+-- "party": a spell whose key opens the party's wheel (ConsumableWheel.lua),
+-- "wheel:party:<spell ID>"
+M.TABS = { "game", "spells", "party", "items", "macros", "bar" }
+-- The game's slots only take spells, items and macros
+M.SLOT_TABS = { "spells", "items", "macros" }
+-- A paddle's key shared by layers: what a router runs
+M.SHARED_TABS = { "spells", "party", "items", "macros" }
+
+local function commandEntry(command)
+    return { action = "cmd:" .. command, name = CK.Paddles:CommandName(command),
+        icon = COMMAND_ICONS[command] or COMMAND_ICON }
+end
+
+M.WHEEL_ICON = "Interface\\Icons\\INV_Potion_54"
+-- The usable items' wheel: a bag
+M.USABLE_ICON = "Interface\\Icons\\INV_Misc_Bag_08"
+
+-- forSlot: for one of the game's bar slots (spells, items, macros only).
+-- noBound: a trigger layer of a pad button, where a game function (a key
+-- binding) never runs: the controller sends the button without the trigger
+function M:Catalog(tab, forSlot, noBound)
+    local list = {}
+    if tab == "game" then
+        local known, cats, byCategory = {}, {}, {}
+        for i = 1, GetNumBindings and GetNumBindings() or 0 do
+            local command, category = GetBinding(i)
+            if command and command ~= "" and category and not command:find("^HEADER_") and not command:find("^CLICK ") then
+                known[command] = true
+                local cat = byCategory[category]
+                if not cat then
+                    cat = { name = _G[category] or category, commands = {} }
+                    byCategory[category] = cat
+                    cats[#cats + 1] = cat
+                end
+                table.insert(cat.commands, command)
+            end
+        end
+        -- The game's own gamepad functions first, after Nothing (a button of
+        -- the game's freed: L3 without the game's autorun...)
+        list[#list + 1] = { header = L.CAT_GAMEPAD }
+        list[#list + 1] = { action = M.NOTHING, name = L.MAP_NO_ACTION, icon = M:ActionIcon(M.NOTHING) }
+        for _, action in ipairs(M.PAD_FUNCTIONS) do
+            if (not action:find("^bar:") or CK.Paddles:NativeButton(action)) and not (noBound and bound(action)) then
+                list[#list + 1] = { action = action, name = M:ActionName(action), icon = M:ActionIcon(action) }
+            end
+        end
+        if noBound then return list end
+        list[#list + 1] = { header = L.CAT_COMMON }
+        for _, command in ipairs(M.COMMON) do
+            if known[command] then list[#list + 1] = commandEntry(command) end
+        end
+        for _, cat in ipairs(cats) do
+            list[#list + 1] = { header = cat.name }
+            for _, command in ipairs(cat.commands) do list[#list + 1] = commandEntry(command) end
+        end
+    elseif (tab == "spells" or tab == "party") and C_SpellBook and C_SpellBook.GetNumSpellBookSkillLines then
+        -- Party: the spells cast on an ally, their key opening the party's
+        -- wheel (you and your party's members) instead of casting at once
+        local party = tab == "party"
+        local bank = Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player or 0
+        local spellType = Enum.SpellBookItemType and Enum.SpellBookItemType.Spell
+        for line = 1, C_SpellBook.GetNumSpellBookSkillLines() do
+            local info = C_SpellBook.GetSpellBookSkillLineInfo(line)
+            if info and not info.shouldHide then
+                local first = true
+                for i = info.itemIndexOffset + 1, info.itemIndexOffset + info.numSpellBookItems do
+                    local item = C_SpellBook.GetSpellBookItemInfo(i, bank)
+                    if item and item.spellID and not item.isPassive and not item.isOffSpec
+                        and (not spellType or item.itemType == spellType)
+                        and (not party or M.ForAllies(item.spellID)) then
+                        if first then
+                            list[#list + 1] = { header = info.name }
+                            first = false
+                        end
+                        list[#list + 1] = { action = (party and "wheel:party:" or "spell:") .. item.spellID, icon = item.iconID,
+                            name = M.SpellName(item.spellID, item.subName) or item.name }
+                    end
+                end
+            end
+        end
+    elseif tab == "items" and C_Container then
+        local seen = {}
+        for bag = 0, NUM_BAG_SLOTS or 4 do
+            for slot = 1, C_Container.GetContainerNumSlots(bag) or 0 do
+                local id = C_Container.GetContainerItemID(bag, slot)
+                if id and not seen[id] and C_Item.GetItemSpell and C_Item.GetItemSpell(id) then
+                    seen[id] = true
+                    list[#list + 1] = { action = "item:" .. id,
+                        name = C_Item.GetItemNameByID(id) or ("item:" .. id), icon = C_Item.GetItemIconByID(id) }
+                end
+            end
+        end
+    elseif tab == "macros" and GetNumMacros then
+        -- Ours first, among what runs something (asked: in Items they were
+        -- hard to find): the consumables wheel, the quick phrases, the
+        -- player's wheels. Not for the game's bar slots or a wheel's slots
+        if not forSlot and CK.ConsumableWheel then
+            list[#list + 1] = { header = L.HDR_OURS }
+            list[#list + 1] = { action = "wheel:consumables", name = L.WHEEL_NAME, icon = M.WHEEL_ICON }
+            list[#list + 1] = { action = "wheel:usable", name = L.USABLE_WHEEL_NAME, icon = M.USABLE_ICON }
+            -- Fork CoolerMgdn: the class's wheel, the target marks', and
+            -- what picks itself (ClassWheels.lua, AutoActions.lua)
+            if CK.ClassWheels then
+                list[#list + 1] = { action = "wheel:class", name = L.CLASS_WHEEL_NAME, icon = CK.ClassWheels:ClassIcon() }
+                list[#list + 1] = { action = "wheel:marks", name = L.MARK_WHEEL_NAME, icon = CK.ClassWheels.MARK_ICON }
+            end
+            if CK.Auto then
+                for _, id in ipairs(CK.Auto.LIST) do
+                    list[#list + 1] = { action = "auto:" .. id, name = CK.Auto:Name(id), icon = CK.Auto:Icon(id) }
+                end
+            end
+            -- The quick phrases window (Phrases.lua), opened like a wheel
+            if CK.Phrases then
+                list[#list + 1] = { action = "wheel:phrases", name = L.PHRASES_NAME, icon = CK.Phrases.ICON }
+            end
+            -- The minimap's labels (MinimapLabels.lua): shown, hidden, or
+            -- shown while held
+            if CK.MinimapLabels then
+                list[#list + 1] = { action = "wheel:minimap", name = L.MML_NAME, icon = CK.MinimapLabels.ICON }
+            end
+            for _, w in ipairs(CK.MyWheels and CK.MyWheels:List() or {}) do
+                list[#list + 1] = { action = "wheel:" .. w.id, name = w.name, icon = CK.MyWheels:Icon(w.id) }
+            end
+            list[#list + 1] = { header = L.MAP_TAB_MACROS }
+        end
+        local account, character = GetNumMacros()
+        local perAccount = MAX_ACCOUNT_MACROS or 120
+        for i = 1, account do
+            local name, icon = GetMacroInfo(i)
+            if name then list[#list + 1] = { action = "macro:" .. name, name = name, icon = icon } end
+        end
+        for i = perAccount + 1, perAccount + character do
+            local name, icon = GetMacroInfo(i)
+            if name then list[#list + 1] = { action = "macro:" .. name, name = name, icon = icon } end
+        end
+    elseif tab == "bar" then
+        for _, layer in ipairs(M.LAYERS) do
+            list[#list + 1] = { header = CK.Paddles:LayerLabel(layer) }
+            for _, input in ipairs(M.INPUTS) do
+                if input.bar and not (layer == "" and FIXED_FACE[input.bar]) then
+                    local action = "bar:" .. M.LAYER_BAR[layer] .. ":" .. input.bar
+                    list[#list + 1] = { action = action, name = CK.Paddles:ActionLabel(action),
+                        icon = CK.Paddles:ActionIcon(action) }
+                end
+            end
+        end
+    end
+    return list
+end
+
+---------------------------------------------------------------------------
+-- Bindings
+---------------------------------------------------------------------------
+local owner
+local takeOwner         -- the game's buttons replaced: priority bindings
+
+-- Fork CoolerMgdn: through the addon's one place for bindings (Binds.lua):
+-- the two owners are its claims "mapping" and "mapping-replaced"; these act
+-- at once, as the game's calls did (the priority argument kept for reading:
+-- each claim has its own)
+local BD = CK.Binds
+local function claimOf(o) return o == takeOwner and "mapping-replaced" or "mapping" end
+local function bset(o, _, combo, command) BD:Set(claimOf(o), combo, command and "command" or nil, command) end
+local function bclick(o, _, combo, name, mouse) BD:Set(claimOf(o), combo, "click", name, mouse) end
+
+-- Every key set on an owner taken away, then the owner cleared. In case a
+-- binding to one of the game's gamepad commands (ping, Start menu...) would
+-- outlive ClearOverrideBindings, each key bound to a command this session
+-- first goes to one that does nothing, and to a button that does nothing,
+-- then to none.
+local noop
+local commanded = {}    -- owner -> keys it bound to a command, this session
+local function unbindAll(o, record, priority)
+    noop = noop or CK.NewFrame("Button", "ControllerKeyboardNoopButton")
+    local keys = commanded[o] or {}
+    for combo in pairs(record) do keys[combo] = true end
+    for combo in pairs(keys) do
+        bset(o, priority, combo, "CONTROLLERKEYBOARD_NOOP")
+        bclick(o, priority, combo, noop:GetName(), "LeftButton")
+        bset(o, priority, combo, nil)
+    end
+    BD:Clear(claimOf(o))
+    wipe(record)
+end
+
+local function bindCommand(o, priority, combo, command)
+    commanded[o] = commanded[o] or {}
+    commanded[o][combo] = true
+    bset(o, priority, combo, command)
+end
+local buttons = {}      -- comboId -> secure button (spells, items, macros)
+
+-- The game's mouseover cast (its enableMouseoverCast setting, on with the
+-- gamepad cursor): its bar buttons cast a helpful spell on the friendly unit
+-- under the cursor, a harmful one on the enemy there (SecureTemplates.lua,
+-- "checkmouseovercast"), its modifier held if one is set. Ours did not: a
+-- heal on a paddle went on the target or yourself, never the raid frame
+-- hovered (reported). Each press picks the unit as the game's button does;
+-- "ck-mo" says what the button's spell or item is for ("help", "harm"),
+-- "ck-mo-any" that no modifier is needed. No unit otherwise, as before.
+local MOUSEOVER = [[
+    local mo = self:GetAttribute("ck-mo")
+    local unit
+    if mo and UnitExists("mouseover") and (self:GetAttribute("ck-mo-any") or IsModifiedClick("MOUSEOVERCAST")) then
+        if (mo == "help" and PlayerCanAssist("mouseover")) or (mo == "harm" and PlayerCanAttack("mouseover")) then
+            unit = "mouseover"
+        end
+    end
+    self:SetAttribute("unit", unit)
+]]
+local moHeader
+
+local function secureButton(comboId)
+    local b = buttons[comboId]
+    if not b then
+        local n = 0
+        for _ in pairs(buttons) do n = n + 1 end
+        b = CK.NewFrame("Button", "ControllerKeyboardMapButton" .. (n + 1), nil, "SecureActionButtonTemplate")
+        b:RegisterForClicks("AnyDown", "AnyUp")
+        b:SetAttribute("useOnKeyDown", true)
+        -- The extra button on screen shows the press
+        local inputId = comboId:match("^(%w+):")
+        b:SetScript("PreClick", function(_, _, down)
+            if down ~= false then CK.Paddles:NotifyPress(inputId) end
+        end)
+        moHeader = moHeader or CK.NewFrame("Frame", nil, nil, "SecureHandlerBaseTemplate")
+        SecureHandlerWrapScript(b, "OnClick", moHeader, MOUSEOVER)
+        b:Hide()
+        buttons[comboId] = b
+    end
+    return b
+end
+
+-- What a spell or an item is for, when the game's mouseover cast is on:
+-- "help", "harm", else nil (a macro: its own options)
+local function safe(f, ...)
+    if not f then return nil end
+    local ok, v = pcall(f, ...)
+    return ok and v or nil
+end
+
+function M.MouseoverKind(kind, value)
+    if not (GetCVarBool and GetCVarBool("enableMouseoverCast")) then return nil end
+    local id = tonumber(value)
+    if not id then return nil end
+    if kind == "spell" and C_Spell then
+        if safe(C_Spell.IsSpellHelpful, id) then return "help" end
+        if safe(C_Spell.IsSpellHarmful, id) then return "harm" end
+    elseif kind == "item" and C_Item then
+        if safe(C_Item.IsHelpfulItem, id) then return "help" end
+        if safe(C_Item.IsHarmfulItem, id) then return "harm" end
+    end
+    return nil
+end
+
+-- A secure button set to cast a spell, use an item or run a macro
+local function actionButton(comboId, action)
+    local kind, value = action:match("^(%a+):(.+)$")
+    local b = secureButton(comboId)
+    b:SetAttribute("type", kind)
+    b:SetAttribute("spell", kind == "spell" and M.SpellCast(value) or nil)
+    b:SetAttribute("item", kind == "item" and ("item:" .. value) or nil)
+    b:SetAttribute("macro", kind == "macro" and value or nil)
+    -- Fork CoolerMgdn: what picks itself (AutoActions.lua): a macro text
+    b:SetAttribute("macrotext", nil)
+    b.ckAuto = nil
+    if kind == "auto" and CK.Auto then CK.Auto:Setup(b, value) end
+    -- The game's mouseover cast, as its own buttons
+    b:SetAttribute("ck-mo", M.MouseoverKind(kind, value))
+    local modifier = GetModifiedClick and GetModifiedClick("MOUSEOVERCAST")
+    b:SetAttribute("ck-mo-any", (modifier == nil or modifier == "NONE") or nil)
+    b:SetAttribute("unit", nil)
+    return b
+end
+
+-- The game's gamepad ping, held then released, opens its wheel and waits
+-- for the same key to be pressed again, a full-screen listener shown until
+-- then: a key of ours changed meanwhile left it up for good, every A in a
+-- menu landing on it as a ping. Ours is the game's other ping binding: hold
+-- (the wheel and the stick), release sends; it never waits.
+local BOUND_AS = { TOGGLEPINGSYSTEM = "TOGGLEPINGLISTENER" }
+
+-- replace: over a button of the game (priority, our second owner)
+-- Fork CoolerMgdn: the key of the touchpad's mouse mode button (Touchpad.lua
+-- T.HoldsKey): its short press clicks what we would bind (M:ShortTarget)
+local function heldByMouse(combo)
+    local T = CK.Touchpad
+    return T and T.HoldsKey and combo and T.HoldsKey(combo:match("([^%-]+)$")) or false
+end
+
+local function bindAction(combo, comboId, action, replace)
+    if heldByMouse(combo) then return end
+    local kind, value = action:match("^(%a+):(.+)$")
+    if kind == "cmd" then value = BOUND_AS[value] or value end
+    local o, record = owner, M.bound
+    if replace then o, record = takeOwner, M.taken end
+    local click
+    if action == M.NOTHING then
+        bset(o, replace or false, combo, NOOP_BINDING)
+        record[combo] = NOOP_BINDING
+    elseif kind == "cmd" then
+        bindCommand(o, replace or false, combo, value)
+        record[combo] = value
+    elseif kind == "bar" then
+        local stance = M:StanceMacro(action)
+        local native = CK.Paddles:NativeButton(action)
+        click = stance and M.KeyRelay(action, stance):GetName() or (native and native:GetName())
+    elseif kind == "wheel" then
+        -- Its key opens that wheel
+        click = CK.ConsumableWheel:Toggle(value, comboId):GetName()
+    elseif M.Routable(action) then
+        local b = actionButton(comboId, action)
+        -- Pressed by its key: acts on the press
+        b:SetAttribute("useOnKeyDown", true)
+        click = b:GetName()
+    end
+    if click then
+        bclick(o, replace or false, combo, click, "LeftButton")
+        record[combo] = "CLICK " .. click .. ":LeftButton"
+    end
+end
+
+-- A paddle's key: one secure button for all its layers, bound to the key
+-- with every modifier the triggers can add. When it is pressed it reads the
+-- triggers held and clicks the button of that layer's action. A trigger
+-- counts as held from the gamepad's state, or from the modifier it adds:
+-- in the key's name (the binding's click "button" names them: "kmSA" for
+-- ALT-SHIFT-) or held (Shift / Ctrl / Alt). Steam Input sends the paddles as
+-- keyboard keys, which can come without the triggers' modifiers: any of
+-- these is enough. Its click "button" for the action names the layer
+-- ("ckRT"...): it picks the "*clickbutton-ckRT" attribute. The gamepad
+-- state lists its buttons from 1, the index the game gives from 0. A layer
+-- with nothing does nothing.
+local ROUTE = [[
+    -- Fork CoolerMgdn: clicked by the mouse mode's button on a short press
+    -- (Touchpad.lua): a press, on its release
+    local short = button and strsub(button, 1, 7) == "ecshort"
+    -- The release: to a wheel of the layer pressed (its hold option), as a
+    -- "ckup" click on this release
+    if not down and not short then
+        -- Fork CoolerMgdn: a press kept for its hold (HoldClock.lua): held
+        -- long enough, the hold; else the layer's own, both on the release
+        local kept = self:GetAttribute("ck-lp")
+        if kept then
+            self:SetAttribute("ck-lp", nil)
+            self:SetAttribute("ec-lp-on", nil)
+            self:SetAttribute("useOnKeyDown", false)
+            if (self:GetAttribute("ec-lp-ticks") or 0) >= (self:GetAttribute("ec-lp-n") or 3) then
+                return "ckhold" .. kept
+            end
+            if self:GetAttribute("ck-has-" .. kept) then return "ck" .. kept end
+            return false
+        end
+        local pressed = self:GetAttribute("ck-pressed")
+        self:SetAttribute("ck-pressed", nil)
+        if pressed and self:GetAttribute("ck-up-" .. pressed) then
+            self:SetAttribute("useOnKeyDown", false)
+            return "ckup" .. pressed
+        end
+        return false
+    end
+    self:SetAttribute("useOnKeyDown", not short)
+    self:SetAttribute("ck-pressed", nil)
+    self:SetAttribute("ck-lp", nil)
+    self:SetAttribute("ec-lp-on", nil)
+    -- LB / RB held with a button of the game's pad: the game's, never ours
+    -- (reported: LB + D-pad down opened the quick phrases put on D-pad down,
+    -- party member 3 never targeted). Read from the pad (RB adds no
+    -- modifier; LB's Ctrl key falls back here). The game's targeting bar on
+    -- (ally, enemy, its shortcuts) gets the press, through a relay on its
+    -- button here, as the game's own binding gives it to the bar on
+    local lb, rb = self:GetAttribute("ck-lb"), self:GetAttribute("ck-rb")
+    if lb or rb then
+        local held = GetGamePadState()
+        local hb = held and held.buttons
+        if hb and ((lb and hb[lb]) or (rb and hb[rb])) then
+            for i = 1, 3 do
+                local game = self:GetFrameRef("ck-sh" .. i)
+                if game and self:GetAttribute("ck-sh-on" .. i) and game:IsVisible() then
+                    return "cksh" .. i
+                end
+            end
+            return false
+        end
+    end
+    -- The trigger toggle on (Toggle.lua): its layer, held or toggled; a
+    -- trigger held was used
+    local layer
+    local toggle = self:GetFrameRef("toggle")
+    if toggle then
+        if toggle:GetAttribute("ck-held-LT") then toggle:SetAttribute("ck-used-LT", true) end
+        if toggle:GetAttribute("ck-held-RT") then toggle:SetAttribute("ck-used-RT", true) end
+        layer = toggle:GetAttribute("ck-layer") or ""
+    else
+        local state = GetGamePadState()
+        local pad = state and state.buttons
+        local came = button or ""
+        local shift = strfind(came, "S", 3, true) or IsShiftKeyDown()
+        local ctrl = strfind(came, "C", 3, true) or IsControlKeyDown()
+        local alt = strfind(came, "A", 3, true) or IsAltKeyDown()
+        local lt, rt = self:GetAttribute("ck-lt"), self:GetAttribute("ck-rt")
+        local ltMod, rtMod = self:GetAttribute("ck-lt-mod"), self:GetAttribute("ck-rt-mod")
+        local ltDown = (pad and lt and pad[lt]) or (ltMod == "SHIFT" and shift)
+            or (ltMod == "CTRL" and ctrl) or (ltMod == "ALT" and alt)
+        local rtDown = (pad and rt and pad[rt]) or (rtMod == "SHIFT" and shift)
+            or (rtMod == "CTRL" and ctrl) or (rtMod == "ALT" and alt)
+        layer = (ltDown and "LT" or "") .. (rtDown and "RT" or "")
+    end
+    -- Fork CoolerMgdn: a double press on this layer. A second press while
+    -- the clock still counts the first (HoldClock.lua): the double press,
+    -- at once, in place of the button's own (and of its hold). Else this
+    -- one runs as usual and waits for a second one.
+    if not short and self:GetAttribute("ck-dbl-" .. layer) then
+        if self:GetAttribute("ec-db-on") and self:GetAttribute("ck-db-layer") == layer
+            and (self:GetAttribute("ec-db-ticks") or 0) < (self:GetAttribute("ec-db-n") or 2) then
+            self:SetAttribute("ec-db-on", nil)
+            self:SetAttribute("ck-db-layer", nil)
+            return "ckdbl" .. layer
+        end
+        self:SetAttribute("ck-db-layer", layer)
+        self:SetAttribute("ec-db-ticks", 0)
+        self:SetAttribute("ec-db-on", true)
+        local clock = self:GetFrameRef("ec-clock")
+        if clock then clock:SetAttribute("state-eclp", "tick") end
+    else
+        self:SetAttribute("ec-db-on", nil)
+    end
+    -- Fork CoolerMgdn: a hold on this layer: nothing yet, the clock counts
+    -- (HoldClock.lua) and the release decides
+    if not short and self:GetAttribute("ck-hold-" .. layer) then
+        self:SetAttribute("ck-lp", layer)
+        self:SetAttribute("ec-lp-ticks", 0)
+        self:SetAttribute("ec-lp-on", true)
+        local clock = self:GetFrameRef("ec-clock")
+        if clock then clock:SetAttribute("state-eclp", "tick") end
+        return false
+    end
+    if not self:GetAttribute("ck-has-" .. layer) then return false end
+    self:SetAttribute("ck-pressed", layer)
+    return "ck" .. layer
+]]
+
+local header
+local routers = {}      -- paddle -> its secure button
+
+-- A wheel on a layer gets the key's release too (its hold option)
+local function setRelease(r, layer, b, action)
+    local wheel = b and type(action) == "string" and action:find("^wheel:") and b
+    r:SetAttribute("ck-up-" .. layer, wheel and true or nil)
+    r:SetAttribute("*clickbutton-ckup" .. layer, wheel or nil)
+end
+M.routers = routers
+
+-- Fork CoolerMgdn: what the mouse mode's button clicks on a short press, for
+-- one layer of its input: the input's router (it reads the layer itself),
+-- else that layer's own button (a key binding command: a plain button
+-- running it). Out of combat (buttons may be made).
+local runners = {}
+local SHORT_COMMANDS = {
+    CONTROLLERKEYBOARD_TOGGLE = function() ControllerKeyboard_Toggle() end,
+    CONTROLLERKEYBOARD_MAP = function() ControllerKeyboard_OpenMap() end,
+    CONTROLLERKEYBOARD_CONFIG = function() ControllerKeyboard_OpenConfig() end,
+}
+function M:ShortTarget(input, layer)
+    if routers[input.id] and (self.padRouted[input.id] or input.paddle) then return routers[input.id] end
+    local action = self:EffectiveAction(input, layer)
+    if not action and input.ps then action = self:GetReplaced(input.id, layer) end
+    if type(action) ~= "string" or action == M.NOTHING then return nil end
+    local kind, value = action:match("^(%a+):(.+)$")
+    local comboId = input.id .. ":" .. layer
+    if kind == "wheel" then return CK.ConsumableWheel:Toggle(value, comboId) end
+    if kind == "cmd" then
+        local command = BOUND_AS[value] or value
+        -- A "click" binding: that button itself
+        local name = command:match("^CLICK ([^:]+):")
+        if name then return _G[name] end
+        -- RunBinding is the game's only (found: ADDON_ACTION_FORBIDDEN):
+        -- our own commands are called directly, the game's can't be
+        local fn = SHORT_COMMANDS[command]
+        if not fn then return nil end
+        local r = runners[comboId]
+        if not r then
+            r = CK.NewFrame("Button", "ControllerKeyboardShortRun" .. comboId:gsub(":", "_"))
+            r:Hide()
+            r:SetScript("OnClick", function(self) if self.fn then self.fn() end end)
+            runners[comboId] = r
+        end
+        r.fn = fn
+        return r
+    end
+    if M.Routable(action) then
+        local b = actionButton(comboId, action)
+        b:SetAttribute("useOnKeyDown", false)
+        return b
+    end
+end
+
+-- A router's name (a key the toggle binds straight to it)
+function M:IsRouter(name)
+    for _, r in pairs(routers) do
+        if r:GetName() == name then return true end
+    end
+    return false
+end
+
+local function router(inputId)
+    local r = routers[inputId]
+    if not r then
+        header = header or CK.NewFrame("Frame", nil, nil, "SecureHandlerBaseTemplate")
+        local n = 0
+        for _ in pairs(routers) do n = n + 1 end
+        r = CK.NewFrame("Button", "ControllerKeyboardRouteButton" .. (n + 1), nil, "SecureActionButtonTemplate")
+        r:RegisterForClicks("AnyDown", "AnyUp")
+        r:SetAttribute("useOnKeyDown", true)
+        r:SetAttribute("type", "click")
+        r:SetScript("PreClick", function(self, _, down)
+            if down ~= false and self.ckInput then CK.Paddles:NotifyPress(self.ckInput) end
+            -- Fork CoolerMgdn: a hold on it: felt as the press becomes one
+            if down ~= false and self.ckHolds and CK.HoldClock then
+                local r = self
+                CK.HoldClock:Feel(r, function() CK.HoldClock:ShowHold(r) end, function() CK.HoldClock:HideHold() end)
+            end
+            if CK.db and CK.db.settings.debug and down ~= false then
+                CK:Print("route %s pressed (%s)", tostring(self.ckInput), tostring(_))
+            end
+        end)
+        -- Fork CoolerMgdn: /ec debug shows each press, the layer the
+        -- router chose (ck-pressed) and whether that layer has an action
+        r:SetScript("PostClick", function(self, button, down)
+            if CK.Flight then pcall(CK.Flight.Press, CK.Flight, self, button, down) end
+            if not (CK.db and CK.db.settings.debug) then return end
+            local st = GetGamePadState and GetGamePadState()
+            local pad = st and st.buttons
+            local lt, rt = self:GetAttribute("ck-lt"), self:GetAttribute("ck-rt")
+            local layer = self:GetAttribute("ck-pressed")
+            CK:Print("route %s %s %s: LT %s RT %s, mods %s%s%s, layer %s, has %s", tostring(self.ckInput),
+                tostring(button), down == false and "up" or "down", tostring(pad and lt and pad[lt]),
+                tostring(pad and rt and pad[rt]), IsShiftKeyDown() and "S" or "", IsAltKeyDown() and "A" or "",
+                IsControlKeyDown() and "C" or "", tostring(layer),
+                tostring(layer and self:GetAttribute("ck-has-" .. layer)))
+        end)
+        SecureHandlerWrapScript(r, "OnClick", header, ROUTE)
+        r:Hide()
+        routers[inputId] = r
+    end
+    return r
+end
+
+local function padIndex(button)
+    local index = C_GamePad and C_GamePad.ButtonBindingToIndex and C_GamePad.ButtonBindingToIndex(button)
+    return index and index + 1
+end
+
+M.padIndex = padIndex
+
+-- What we bound on a key: ("click", button name, mouse button) or ("cmd",
+-- command); nothing when the key is not ours
+function M:BindingOf(combo)
+    local b = self.taken[combo] or self.bound[combo]
+    if not b then return nil end
+    local name, button = b:match("^CLICK ([^:]+):(.+)$")
+    if name then return "click", name, button end
+    return "cmd", b
+end
+
+-- The binding's click "button" for a key's modifiers: "km", "kmS", "kmSA"...
+local function modHint(prefix)
+    return "km" .. (prefix:find("SHIFT", 1, true) and "S" or "") .. (prefix:find("ALT", 1, true) and "A" or "")
+        .. (prefix:find("CTRL", 1, true) and "C" or "")
+end
+
+-- Fork CoolerMgdn: a router's hold for each layer ("*clickbutton-ckhold"
+-- .. layer), the clock on it when it has one
+-- (a double press's too: "*clickbutton-ckdbl" .. layer)
+local function extraButton(comboId, action)
+    if action:find("^wheel:") then
+        return CK.ConsumableWheel:Toggle(action:match("^wheel:(.+)$"), comboId)
+    elseif action:find("^bar:") then
+        return CK.Paddles:NativeButton(action) and M.BarRelay(action)
+    elseif M.Routable(action) then
+        local b = actionButton(comboId, action)
+        b:SetAttribute("useOnKeyDown", false)
+        return b
+    end
+end
+
+local function setHolds(r, input)
+    local any, anyDouble = false, false
+    for _, layer in ipairs(M.LAYERS) do
+        local action = M:GetHold(input.id, layer)
+        local b
+        if action and not M:HoldBlocked(input, layer) then
+            b = extraButton(input.id .. ":" .. M.HOLD .. layer, action)
+        end
+        r:SetAttribute("*clickbutton-ckhold" .. layer, b or nil)
+        r:SetAttribute("ck-hold-" .. layer, b and true or nil)
+        if b then any = true end
+        local double = M:GetDouble(input.id, layer)
+        local d
+        if double and not M:DoubleBlocked(input, layer) then
+            d = extraButton(input.id .. ":" .. M.DOUBLE .. layer, double)
+        end
+        r:SetAttribute("*clickbutton-ckdbl" .. layer, d or nil)
+        r:SetAttribute("ck-dbl-" .. layer, d and true or nil)
+        if d then anyDouble = true end
+    end
+    -- (a press waiting for its second one forgotten)
+    r:SetAttribute("ck-db-layer", nil)
+    r:SetAttribute("ec-db-on", nil)
+    if (any or anyDouble) and CK.HoldClock then CK.HoldClock:Attach(r) end
+    r.ckHolds = any
+    return any or anyDouble
+end
+
+-- A paddle's spells, items, macros and wheels: its router, bound to the key
+-- with each modifier the triggers add, but those a game function takes
+local function routeKeys(input, key, taken)
+    local r = router(input.id)
+    r.ckInput = input.id
+    r:SetAttribute("ck-lb", nil)
+    r:SetAttribute("ck-rb", nil)
+    M:SetShoulderRefs(r, input)
+    r:SetAttribute("ck-lt", padIndex("PADLTRIGGER"))
+    r:SetAttribute("ck-rt", padIndex("PADRTRIGGER"))
+    r:SetAttribute("ck-lt-mod", M:TriggerModifier("PADLTRIGGER"))
+    r:SetAttribute("ck-rt-mod", M:TriggerModifier("PADRTRIGGER"))
+    for _, layer in ipairs(M.LAYERS) do
+        r:SetAttribute("ck-has-" .. layer, nil)
+        r:SetAttribute("*clickbutton-ck" .. layer, nil)
+        -- What the layer runs (a layer sharing the key of one with Nothing:
+        -- nothing, as the Gamepad tab shows it)
+        local action = M:EffectiveAction(input, layer)
+        local b
+        if M.Routable(action) and not taken[M:ArrivalPrefix(layer)] then
+            b = action:find("^wheel:") and CK.ConsumableWheel:Toggle(action:match("^wheel:(.+)$"), input.id .. ":" .. layer)
+                or actionButton(input.id .. ":" .. layer, action)
+            -- Clicked by the key's button, once per press
+            b:SetAttribute("useOnKeyDown", false)
+            r:SetAttribute("*clickbutton-ck" .. layer, b)
+            r:SetAttribute("ck-has-" .. layer, true)
+        end
+        setRelease(r, layer, b, action)
+    end
+    setHolds(r, input)
+    for prefix, isTaken in pairs(taken) do
+        if not isTaken and not heldByMouse(prefix .. key) then
+            local hint = modHint(prefix)
+            bclick(owner, false, prefix .. key, r:GetName(), hint)
+            M.bound[prefix .. key] = "CLICK " .. r:GetName() .. ":" .. hint
+        end
+    end
+end
+
+-- Each key a paddle sends. A game function takes the key of its layer (and
+-- of the layers sharing it, a trigger that is no modifier adds nothing to
+-- the key); the spells, items, macros and wheels of every layer go to the
+-- paddle's router, on all the other keys.
+function M:ApplyPaddle(input)
+    local key = self:InputKey(input)
+    if not key then return end
+    -- Nothing on a layer keeps the key to itself only while no other layer
+    -- of the paddle runs something of ours; else the key goes to the router
+    -- too (it reads the triggers held), that layer doing nothing there. A
+    -- key that came without its trigger's modifier still runs that
+    -- trigger's layer (found by the tests: Nothing alone, a spell on LT, LT
+    -- + the paddle sent without Shift did nothing)
+    local anyRoutable = false
+    for _, layer in ipairs(M.LAYERS) do
+        if M.Routable(self:EffectiveAction(input, layer)) then anyRoutable = true end
+        if self:GetHold(input.id, layer) or self:GetDouble(input.id, layer) then anyRoutable = true end
+    end
+    local taken, routed = {}, false
+    for _, layer in ipairs(M.LAYERS) do
+        local prefix = self:ArrivalPrefix(layer)
+        if taken[prefix] == nil then
+            local action = self:Get(input.id, layer)
+            taken[prefix] = type(action) == "string" and not M.Routable(action)
+                and not (action == M.NOTHING and anyRoutable)
+            if taken[prefix] then bindAction(prefix .. key, input.id .. ":" .. layer, action) end
+        end
+    end
+    for _, layer in ipairs(M.LAYERS) do
+        if M.Routable(self:EffectiveAction(input, layer)) and not taken[self:ArrivalPrefix(layer)] then routed = true end
+        -- Fork CoolerMgdn: a hold too (its router runs it)
+        if (self:GetHold(input.id, layer) or self:GetDouble(input.id, layer))
+            and not taken[self:ArrivalPrefix(layer)] then routed = true end
+    end
+    if routed then routeKeys(input, key, taken) end
+end
+
+---------------------------------------------------------------------------
+-- The pad's own buttons with something of ours on them (a free button's
+-- spell, a replaced button's wheel...) go to a router too. Players saw a
+-- wheel on D-pad down open with RT held as well, and one on LT + D-pad down
+-- never open: the key had come without the trigger's modifier, which the
+-- game itself doesn't need (its bars read the triggers held). The router
+-- reads the triggers held when the key is pressed, whatever the key came
+-- with, and runs that layer's: ours, or the game's bar button of that
+-- layer. A layer the game runs with a key binding (a command) can't be
+-- clicked: such a button keeps its keys bound as before.
+---------------------------------------------------------------------------
+local relays = {}
+M.relayMacros = {}      -- relay's name -> its macro
+M.relayBars = {}        -- relay's name -> the bar button it presses ("bar:right:a")
+
+-- A macro in the game's slot runs from the slot itself (UseAction, as the
+-- game's button does), not through the "/click": a macro started by a macro
+-- doesn't run (reported, and checked in game: a macro on RT + A did nothing
+-- once the addon routed A, the spell alone in that slot worked). The slot
+-- is read on the press from the game's button, as the game computes it: its
+-- storage id on the action page; the stance bar's in a stance. Anything
+-- else (spells, items, flyouts, the game's own functions) keeps the click.
+local RELAY_SLOT = [[
+    local b = self:GetFrameRef("ck-native")
+    -- In a stance (stealth, a form, a warrior's stance): the stance bar's
+    -- button, as the game shows its stance bar (a bonus bar on). Not the
+    -- macro option [bonusbar]: false in stealth in WoW Forever (reported:
+    -- RT + D-pad up did nothing in stealth once the addon routed it)
+    local stance = self:GetFrameRef("ck-stance")
+    local inStance = stance and (GetBonusBarOffset() or 0) > 0
+    if inStance then b = stance end
+    self:SetAttribute("macrotext", self:GetAttribute(inStance and "ck-text-stance" or "ck-text-native"))
+    local id = b and b:GetID()
+    local slot
+    if id and id > 0 then
+        local page = b:GetAttribute("actionpage") or GetActionBarPage() or 1
+        slot = id + (page - 1) * 12
+    end
+    if slot and GetActionInfo(slot) == "macro" then
+        self:SetAttribute("type", "action")
+        self:SetAttribute("action", slot)
+    else
+        self:SetAttribute("type", "macro")
+    end
+]]
+
+-- The game's button a relay reads its slot from (nothing when it can't be
+-- referenced: the click alone then)
+local function setRef(r, label, button)
+    if not (button and pcall(SecureHandlerSetFrameRef, r, label, button)) then
+        r:SetAttribute("frameref-" .. label, nil)
+    end
+end
+
+-- The game's bar button "/click"ed down, as its own binding presses it (a
+-- macro: the stance bar's in a stance, see StanceMacro), or its slot run
+-- when it holds a macro (RELAY_SLOT). Clicked by a router (once per press),
+-- or by a key bound to it (on the press).
+local function newRelay(id, macro, onKey)
+    local key = (onKey and "key:" or "router:") .. id
+    local r = relays[key]
+    if not r then
+        local n = 0
+        for _ in pairs(relays) do n = n + 1 end
+        r = CK.NewFrame("Button", "ControllerKeyboardBarRelay" .. (n + 1), nil, "SecureActionButtonTemplate")
+        if onKey then r:RegisterForClicks("AnyDown") else r:RegisterForClicks("AnyDown", "AnyUp") end
+        r:SetAttribute("useOnKeyDown", onKey and true or false)
+        header = header or CK.NewFrame("Frame", nil, nil, "SecureHandlerBaseTemplate")
+        SecureHandlerWrapScript(r, "OnClick", header, RELAY_SLOT)
+        r:Hide()
+        relays[key] = r
+    end
+    local P = CK.Paddles
+    local native = P:NativeButton(id)
+    local stance = M:StanceMacro(id) and P:StanceButton(id) or nil
+    local function click(b)
+        local name = b and b:GetName()
+        return name and ("/click " .. name .. " LeftButton true") or nil
+    end
+    -- The click for each case, chosen on the press (RELAY_SLOT)
+    local nativeText = click(native) or macro
+    r:SetAttribute("type", "macro")
+    r:SetAttribute("macrotext", nativeText)
+    r:SetAttribute("ck-text-native", nativeText)
+    r:SetAttribute("ck-text-stance", click(stance))
+    setRef(r, "ck-native", native)
+    setRef(r, "ck-stance", stance)
+    M.relayMacros[r:GetName()] = macro
+    M.relayBars[r:GetName()] = id
+    return r
+end
+
+local function relay(barAction)
+    return newRelay(barAction, M:BarMacro(barAction), false)
+end
+-- The relay a router clicks (the trigger toggle clicks it too)
+M.BarRelay = relay
+
+function M.KeyRelay(barAction, macro)
+    return newRelay(barAction, macro, true)
+end
+
+-- The game's bars a shoulder held puts on (its gamepad bar's override bars):
+-- ally targeting (a party member on the D-pad, yourself on A...), enemy
+-- targeting, its shortcuts
+M.SHOULDER_BARS = { "friendlyTargeting", "hostileTargeting", "shortcuts" }
+local shoulderRelays = {}
+
+-- A relay "/click"ing one of their buttons, pressed then released as the
+-- game's binding does (its targeting acts on the press, its group
+-- navigation stops on the release)
+local function shoulderRelay(name)
+    local r = shoulderRelays[name]
+    if not r then
+        local n = 0
+        for _ in pairs(shoulderRelays) do n = n + 1 end
+        r = CK.NewFrame("Button", "ControllerKeyboardShoulderRelay" .. (n + 1), nil, "SecureActionButtonTemplate")
+        r:RegisterForClicks("AnyDown", "AnyUp")
+        r:SetAttribute("useOnKeyDown", false)
+        r:SetAttribute("type", "macro")
+        r:SetAttribute("macrotext", "/click " .. name .. " LeftButton true\n/click " .. name .. " LeftButton false")
+        r:Hide()
+        shoulderRelays[name] = r
+    end
+    return r
+end
+
+-- A pad router's refs to those bars' buttons in its place
+function M:SetShoulderRefs(r, input)
+    for i, bar in ipairs(M.SHOULDER_BARS) do
+        local game = input.bar and CK.Paddles:NativeButton("bar:" .. bar .. ":" .. input.bar)
+        local name = game and game.GetName and game:GetName()
+        if name then
+            SecureHandlerSetFrameRef(r, "ck-sh" .. i, game)
+            r:SetAttribute("*clickbutton-cksh" .. i, shoulderRelay(name))
+            r:SetAttribute("ck-sh-on" .. i, true)
+        else
+            r:SetAttribute("frameref-ck-sh" .. i, nil)
+            r:SetAttribute("*clickbutton-cksh" .. i, nil)
+            r:SetAttribute("ck-sh-on" .. i, nil)
+        end
+    end
+end
+
+-- What each layer of a pad button runs through its router: { action } or
+-- { native = the game's button }, nothing for a layer left empty. Nil when
+-- the button has nothing of ours, or a layer only a key binding runs.
+-- Second value: a replaced button of the game (bound with priority).
+function M:PadTargets(input, withHold)
+    if input.layer or input.paddle or not self:InputKey(input) then return nil end
+    -- Fork CoolerMgdn: a hold on it (or asked: could it have one)
+    local holds = withHold or self:HasHold(input) or self:HasDouble(input)
+    local targets, ours, replaced = {}, false, false
+    local replaceOn = self:ReplaceOn() and self:OwnKeys()
+    for _, layer in ipairs(M.LAYERS) do
+        local combo = self:Combo(input, layer)
+        if combo then
+            local action, isReplaced
+            local free = self:State(input, layer) == "free"
+            if free then action = self:Get(input.id, layer) end
+            if not action and replaceOn and self:Replaceable(input, layer) then
+                action = self:GetReplaced(input.id, layer)
+                isReplaced = action ~= nil
+                -- Fork CoolerMgdn: saved while the window saw the key free
+                if not action then action = self:Get(input.id, layer) end
+            end
+            -- Fork CoolerMgdn: saved as a game button replaced while the
+            -- window saw a game binding on the key, found free here (found:
+            -- L2 + R2 + Create, its key's "game binding" was our own one,
+            -- read back through the gamepad context): run it all the same
+            if not action and free and replaceOn then
+                action = self:GetReplaced(input.id, layer)
+                isReplaced = action ~= nil
+            end
+            local native = action and action:find("^bar:") and CK.Paddles:NativeButton(action)
+            -- LB / RB with a trigger: the game's class actions, read from
+            -- the buttons held whatever the key runs (LT + LB, RT + RB...)
+            local classLayer = (input.id == "LB" or input.id == "RB") and layer ~= "" and layer ~= CROSSED[input.id]
+            if action == M.NOTHING or (classLayer and not action) then
+                targets[layer] = nil
+            elseif action and M.Routable(action) then
+                targets[layer] = { action = action }
+            elseif native then
+                targets[layer] = { bar = action }
+            elseif action then
+                return nil
+            else
+                native = self:NativeBarButton(input, layer)
+                if native then
+                    targets[layer] = { bar = self:BarAction(input, layer) }
+                elseif self:NativeBinding(combo) or (not HELD_ALONE[input.id]
+                    and self:NativeBinding(self:InputKey(input))) then
+                    -- The game's command there (or the key without the
+                    -- modifier's, it falls back to): a key binding
+                    return nil
+                end
+            end
+            if action then ours, replaced = true, replaced or isReplaced end
+        end
+    end
+    if not ours and not holds then return nil end
+    -- A trigger that is no modifier: its layer shares the key of the one
+    -- without it, and what it runs (as before)
+    for _, layer in ipairs(M.LAYERS) do
+        if not self:Combo(input, layer) then targets[layer] = targets[self:SharedLayers(layer)[1]] end
+    end
+    return targets, replaced
+end
+
+function M:ApplyPad(input, targets, replaced)
+    local key = self:InputKey(input)
+    local r = router(input.id)
+    r.ckInput = input.id
+    -- The face buttons and the D-pad: LB / RB held leave them to the game
+    r:SetAttribute("ck-lb", input.bar and padIndex("PADLSHOULDER") or nil)
+    r:SetAttribute("ck-rb", input.bar and padIndex("PADRSHOULDER") or nil)
+    self:SetShoulderRefs(r, input)
+    r:SetAttribute("ck-lt", padIndex("PADLTRIGGER"))
+    r:SetAttribute("ck-rt", padIndex("PADRTRIGGER"))
+    r:SetAttribute("ck-lt-mod", M:TriggerModifier("PADLTRIGGER"))
+    r:SetAttribute("ck-rt-mod", M:TriggerModifier("PADRTRIGGER"))
+    for _, layer in ipairs(M.LAYERS) do
+        r:SetAttribute("ck-has-" .. layer, nil)
+        r:SetAttribute("*clickbutton-ck" .. layer, nil)
+        local t, b = targets[layer], nil
+        if t and t.action then
+            b = t.action:find("^wheel:") and CK.ConsumableWheel:Toggle(t.action:match("^wheel:(.+)$"), input.id .. ":" .. layer)
+                or actionButton(input.id .. ":" .. layer, t.action)
+            -- Clicked by the key's button, once per press
+            b:SetAttribute("useOnKeyDown", false)
+        elseif t and t.bar then
+            b = relay(t.bar)
+        end
+        if b then
+            r:SetAttribute("*clickbutton-ck" .. layer, b)
+            r:SetAttribute("ck-has-" .. layer, true)
+        end
+        setRelease(r, layer, b, t and t.action)
+    end
+    setHolds(r, input)
+    local o, record = owner, self.bound
+    if replaced then o, record = takeOwner, self.taken end
+    local done = {}
+    for _, layer in ipairs(M.LAYERS) do
+        local combo = self:Combo(input, layer)
+        -- Fork CoolerMgdn: the mouse mode's button clicks it (short press)
+        if heldByMouse(combo) then done[combo] = true end
+        if combo and not done[combo] then
+            done[combo] = true
+            local hint = modHint(combo:sub(1, #combo - #key))
+            bclick(o, replaced and true or false, combo, r:GetName(), hint)
+            record[combo] = "CLICK " .. r:GetName() .. ":" .. hint
+        end
+    end
+end
+
+-- Ours were replaced (a gamepad window of the game rebinds the pad when it
+-- closes): set them again. Only then, so the game's own refreshes don't
+-- make us rebind for nothing.
+function M:Repair()
+    if self.pending then return self:Apply() end
+    for combo, want in pairs(self.bound) do
+        local now = GetBindingAction(combo, true)
+        -- (Fork CoolerMgdn: another of ours over it, by the bindings' one
+        -- place: not the game's, nothing to repair)
+        if now ~= want and not (CK.Toggle and CK.Toggle:Holds(combo)) and not BD:HeldByOther("mapping", combo, now) then
+            return self:Apply()
+        end
+    end
+    -- The game's buttons replaced: its binding sets (menus, its own while a
+    -- trigger is held) go over ours for a while; checked once none is left
+    local manager = GamepadSharedUtility and GamepadSharedUtility.InputBindingManager
+    local stack = manager and manager.bindingSetStack
+    if stack and #stack > 0 then return end
+    for combo, want in pairs(self.taken) do
+        local now = GetBindingAction(combo, true)
+        if now ~= want and not (CK.Toggle and CK.Toggle:Holds(combo))
+            and not BD:HeldByOther("mapping-replaced", combo, now) then
+            return self:Apply()
+        end
+    end
+end
+
+-- No gamepad window has the focus (the game's own HUD bindings are active)
+-- (The target's menu isn't one of the game's windows: its cursor
+-- (SmartNavigation) moves in it with a binding set of its own pushed on the
+-- game's binding stack. Found by that: a cursor set binding the D-pad, its
+-- frame on screen; one left behind with no frame shown doesn't count - the
+-- way ControllerForever's Binds.lua tells them, its author's code free to
+-- reuse. Second value: the set's name, for the flight recorder.)
+local function cursorSetOpen()
+    local util = GamepadSharedUtility
+    local manager = util and util.InputBindingManager
+    local stack = type(manager) == "table" and manager.bindingSetStack
+    if type(stack) ~= "table" then return false end
+    local nav = SmartNavigation
+    local info = type(nav) == "table" and nav.activeInfo
+    local frame = type(info) == "table" and info.frame
+    if not (frame and frame.IsVisible and frame:IsVisible()) then return false end
+    for _, set in ipairs(stack) do
+        local name = type(set) == "table" and type(set.name) == "string" and set.name or ""
+        if name:find("^SmartNavigationBindings") and not set.treatBindsAsCore and type(set.bindings) == "table" then
+            for key in pairs(set.bindings) do
+                if type(key) == "string" and key:find("PADD") then
+                    local fname = frame.GetName and frame:GetName() or "?"
+                    return true, name .. " on " .. tostring(fname)
+                end
+            end
+        end
+    end
+    return false
+end
+
+function M.GameMenuOpen()
+    local ok, open, why = pcall(function()
+        local manager = Menu and Menu.GetManager and Menu.GetManager()
+        if manager and manager.GetOpenMenu and manager:GetOpenMenu() then return true, "Menu" end
+        if DropDownList1 and DropDownList1:IsShown() then return true, "DropDownList1" end
+        return cursorSetOpen()
+    end)
+    if ok and open then return true, why end
+    return false
+end
+
+function M:CoreActive()
+    local manager = GamepadMode and GamepadMode.FrameControlsManager
+    if manager and manager.GetActiveFrame and manager:GetActiveFrame() then return false end
+    -- Fork CoolerMgdn: a menu of the game (a target's menu: its "Inspect"
+    -- on Y, right-click menus): it moves with the D-pad, ours would take it
+    -- back (reported: the target's menu didn't follow the D-pad)
+    if M.GameMenuOpen() then return false end
+    -- The chat keyboard, the quick phrases or a wheel open: their keys stay
+    -- theirs (reported: D-pad down given the phrases closed them instead of
+    -- moving in them, ours set again over theirs)
+    if CK.IsOpen and CK:IsOpen() then return false end
+    if CK.Phrases and CK.Phrases:IsOpen() then return false end
+    if ControllerKeyboardWheel and ControllerKeyboardWheel:IsShown() then return false end
+    return not (CK.Config and CK.Config:IsOpen())
+end
+
+function M:Apply()
+    if InCombatLockdown() or not self:CoreActive() then
+        self.pending = true
+        -- A menu of the game, or our panel: its buttons back to it
+        self:Release()
+        if CK.Toggle then CK.Toggle:Apply() end
+        return
+    end
+    self.pending = false
+    self.applying = true
+    owner = owner or CK.NewFrame("Frame")
+    takeOwner = takeOwner or CK.NewFrame("Frame")
+    BD:Register("mapping", owner, 10, false, { label = "mapping" })
+    BD:Register("mapping-replaced", takeOwner, 20, true, { label = "mapping (replaced)" })
+    unbindAll(owner, self.bound, false)
+    unbindAll(takeOwner, self.taken, true)
+    self.padRouted = {}
+    if self:Enabled() then
+        -- The pad's buttons with something of ours: their routers
+        for _, input in ipairs(M.INPUTS) do
+            local targets, replaced = self:PadTargets(input)
+            if targets then
+                self.padRouted[input.id] = true
+                self:ApplyPad(input, targets, replaced)
+            end
+        end
+        for comboId, action in pairs(settings().mapping) do
+            local inputId, layer = comboId:match("^(%w+):(%a*)$")
+            local input = inputId and M.BY_ID[inputId]
+            -- Never on an input the game uses
+            if input and not input.paddle and not self.padRouted[inputId] and type(action) == "string"
+                and not M.ExtraLayer(layer) and self:State(input, layer) == "free" then
+                bindAction(self:Combo(input, layer), comboId, action)
+            end
+        end
+        for _, input in ipairs(M.INPUTS) do
+            if input.paddle and self:InputEnabled(input) then self:ApplyPaddle(input) end
+        end
+        self:ApplyReplaced()
+        self:BlockFallbacks()
+        self:KeepShoulders()
+    end
+    -- The trigger toggle's keys over ours (it reads what we bound)
+    if CK.Toggle then CK.Toggle:Apply() end
+    -- Fork CoolerMgdn: the mouse mode's button and its short press
+    if CK.Touchpad and CK.Touchpad.SyncMouseShort then CK.Touchpad:SyncMouseShort() end
+    -- The panel's shortcut held: its second button left to the game
+    if self.suspended then self:Suspend(self.suspended) end
+    self:UpdateMarks()
+    -- The stick's direction keys, while a party spell is on a button
+    if CK.ConsumableWheel and CK.ConsumableWheel.SyncStickKeys then CK.ConsumableWheel:SyncStickKeys() end
+    self.applying = false
+    -- Fork CoolerMgdn: the flight recorder (Flight.lua)
+    if CK.Flight then
+        local n = 0
+        for _ in pairs(self.bound) do n = n + 1 end
+        for _ in pairs(self.taken) do n = n + 1 end
+        CK.Flight:Note("our bindings set: %d keys, %d buttons routed", n, (function()
+            local r = 0
+            for _ in pairs(self.padRouted) do r = r + 1 end
+            return r
+        end)())
+    end
+end
+
+-- A key with a trigger modifier and no binding of its own falls back to the
+-- key without it: our action on L3 alone ran on LT + L3 too, a wheel opened
+-- in every layer. The layers of our keys left free get a binding that does
+-- nothing (the game's own bindings, of its gamepad UI too, stay).
+local NOOP = "CONTROLLERKEYBOARD_NOOP"
+function M:BlockFallbacks()
+    for _, input in ipairs(M.INPUTS) do
+        local key = not input.layer and self:InputKey(input)
+        if key and (self.bound[key] or self.taken[key]) and self.bound[key] ~= NOOP then
+            for _, layer in ipairs(M.LAYERS) do
+                local prefix = input.paddle and self:ArrivalPrefix(layer) or self:LayerPrefix(layer)
+                local combo = prefix and prefix ~= "" and prefix .. key
+                if combo and not (self.bound[combo] or self.taken[combo]) and not self:NativeBinding(combo) then
+                    bset(owner, false, combo, NOOP)
+                    self.bound[combo] = NOOP
+                end
+            end
+        end
+    end
+end
+
+-- LB / RB with a button of the game's pad belong to the game (its targeting
+-- bars: a party member on the D-pad, yourself on A...). A shoulder the game
+-- makes a modifier (LB is Ctrl by default) sends keys of its own
+-- ("CTRL-PADDDOWN"), with no binding: they fell back to the key alone, ours
+-- (reported: LB + D-pad down opened the quick phrases put on D-pad down).
+-- A button through its router: that key falls back to the router, which
+-- reads the shoulders held. A button bound straight (a game function of
+-- ours on one of its layers): those keys get what the game does there
+-- without us (its command for the key, or nothing). Keys with nothing of
+-- ours are left as they are.
+function M:ShoulderMods()
+    local mods = {}
+    for _, e in ipairs(EMULATE) do
+        local button = GetCVar(e[2])
+        if button == "PADLSHOULDER" or button == "PADRSHOULDER" then mods[e[1]] = true end
+    end
+    return mods
+end
+
+function M:KeepShoulders()
+    local shoulder = self:ShoulderMods()
+    if not next(shoulder) or not takeOwner then return end
+    for _, input in ipairs(M.INPUTS) do
+        local key = input.bar and not input.paddle and not self.padRouted[input.id] and self:InputKey(input)
+        local ours = false
+        if key then
+            for _, layer in ipairs(M.LAYERS) do
+                local combo = self:ArrivalPrefix(layer) .. key
+                if self.bound[combo] or self.taken[combo] then ours = true end
+            end
+        end
+        if ours then
+            for _, layer in ipairs(M.LAYERS) do
+                -- The layer's modifiers, and the shoulder's
+                local mods = {}
+                for mod in self:ArrivalPrefix(layer):gmatch("(%u+)%-") do mods[mod] = true end
+                for mod in pairs(shoulder) do mods[mod] = true end
+                local prefix = ""
+                for _, e in ipairs(EMULATE) do
+                    if mods[e[1]] then prefix = prefix .. e[1] .. "-" end
+                end
+                local combo = prefix .. key
+                if not (self.bound[combo] or self.taken[combo]) then
+                    local command = self:NativeBinding(combo) or self:NativeBinding(key)
+                    if command then
+                        bindCommand(takeOwner, true, combo, command)
+                        self.taken[combo] = command
+                    else
+                        bset(takeOwner, true, combo, NOOP)
+                        self.taken[combo] = NOOP
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- The panel's shortcut (RB + D-pad down): while its first button is held,
+-- out of combat, what we put on the second one is taken off, so the press
+-- only opens the panel (a wheel on D-pad down opened with it). Back on
+-- release.
+function M:Suspend(key)
+    if InCombatLockdown() or not (owner and key) then return end
+    self.suspended = key
+    if self.bound[key] then
+        bset(owner, false, key, nil)
+        self.bound[key] = nil
+    end
+    if self.taken[key] then
+        bset(takeOwner, true, key, nil)
+        self.taken[key] = nil
+    end
+    if CK.Toggle then CK.Toggle:Unbind(key) end
+end
+
+function M:Resume()
+    if not self.suspended then return end
+    self.suspended = nil
+    self:Apply()
+end
+
+function M:IsOurs(key)
+    return key and (self.bound[key] or self.taken[key]) and self.bound[key] ~= NOOP and true or false
+end
+
+-- The game's buttons the player replaced, and the other layers of each
+function M:ApplyReplaced()
+    if not (self:ReplaceOn() and self:OwnKeys()) then return end
+    for _, input in ipairs(M.INPUTS) do
+        local replaced = {}
+        for _, layer in ipairs(M.padRouted[input.id] and {} or M.LAYERS) do
+            local action = self:Replaceable(input, layer) and self:GetReplaced(input.id, layer)
+            if action then replaced[layer] = action end
+        end
+        if next(replaced) then
+            for _, layer in ipairs(M.LAYERS) do
+                local combo = self:Combo(input, layer)
+                if combo and replaced[layer] then
+                    bindAction(combo, input.id .. ":" .. layer, replaced[layer], true)
+                elseif combo and not self.bound[combo] then
+                    self:KeepNative(input, layer, combo)
+                end
+            end
+        end
+    end
+end
+
+-- What the game does on the key of a layer left to it: its bar button, else
+-- its binding (the key's own, or the one without modifiers it fell back to)
+function M:KeepNative(input, layer, combo)
+    local native = self:NativeBarButton(input, layer)
+    local stance = native and self:StanceMacro(self:BarAction(input, layer))
+    local name = stance and M.KeyRelay(self:BarAction(input, layer), stance):GetName() or (native and native:GetName())
+    if name then
+        bclick(takeOwner, true, combo, name, "LeftButton")
+        self.taken[combo] = "CLICK " .. name .. ":LeftButton"
+        return
+    end
+    -- The sticks: while a trigger is held the game binds them itself
+    if input.id == "L3" or input.id == "R3" then return end
+    local command = self:NativeBinding(combo) or self:NativeBinding(self:InputKey(input))
+    if command then
+        bindCommand(takeOwner, true, combo, command)
+        self.taken[combo] = command
+    end
+end
+
+-- Our replacements taken away, out of combat: a menu of the game (or our
+-- panel) has the focus. Set again when it closes.
+-- Fork CoolerMgdn: every key of ours given back while a menu of the game is
+-- open (its D-pad moves in it), set again once it closes
+function M:ReleaseAll()
+    if InCombatLockdown() or not owner then return end
+    self.applying = true
+    unbindAll(owner, self.bound, false)
+    if takeOwner then unbindAll(takeOwner, self.taken, true) end
+    self.applying = false
+    self.pending = true
+end
+
+local menuWas = false
+C_Timer.NewTicker(0.2, function()
+    if not CK.db then return end
+    local open, why = M.GameMenuOpen()
+    if open == menuWas then return end
+    if InCombatLockdown() then return end
+    menuWas = open
+    if CK.Flight then CK.Flight:Note("game menu %s", open and ("open (" .. tostring(why) .. "): our keys given back") or "closed") end
+    if open then
+        M:ReleaseAll()
+    elseif M:CoreActive() then
+        M:Apply()
+    end
+end)
+
+function M:Release()
+    if InCombatLockdown() or not (takeOwner and next(self.taken)) then return end
+    local keys = {}
+    for combo in pairs(self.taken) do keys[#keys + 1] = combo end
+    self.applying = true
+    unbindAll(takeOwner, self.taken, true)
+    self.applying = false
+    self.pending = true
+    -- For /ec binds: what each key runs once ours are away
+    local after = {}
+    table.sort(keys)
+    for _, combo in ipairs(keys) do after[#after + 1] = combo .. " = " .. tostring(GetBindingAction(combo, true)) end
+    self.lastRelease = date("%H:%M:%S") .. "  " .. table.concat(after, ", ")
+end
+
+-- Our function's picture over the game's bar button it replaces (what the
+-- slot holds stays under it), in the button's shape: round, or square with
+-- the game's corners (the D-pad's; reported: a party spell round there)
+local marks = {}        -- the game's button -> our picture
+M.marks = marks
+
+local function isSquare(native)
+    if native.activeButtonShape then return native.activeButtonShape == "Square" end
+    local mask = native.SquareMask
+    return type(mask) == "table" and type(mask.IsShown) == "function" and mask:IsShown() and true or false
+end
+
+local function shapeMark(mark, square)
+    if mark.square == square then return end
+    local key = square and "squareMasks" or "roundMasks"
+    for _, old in ipairs({ "squareMasks", "roundMasks" }) do
+        if old ~= key and mark[old] then
+            mark.bg:RemoveMaskTexture(mark[old][1])
+            mark.icon:RemoveMaskTexture(mark[old][2])
+        end
+    end
+    if not mark[key] then
+        mark[key] = {}
+        for i = 1, 2 do
+            local mask = mark:CreateMaskTexture()
+            if square then
+                mask:SetAtlas("SquareMask")
+                mask:SetAllPoints(mark.bg)
+            else
+                mask:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask", "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+                mask:SetAllPoints(mark.round[i])
+            end
+            mark[key][i] = mask
+        end
+    end
+    mark.bg:AddMaskTexture(mark[key][1])
+    mark.icon:AddMaskTexture(mark[key][2])
+    mark.square = square
+end
+function M:UpdateMarks()
+    local wanted = {}
+    if self:ReplaceOn() and self:OwnKeys() then
+        for comboId, action in pairs(settings().replaced) do
+            local inputId, layer = comboId:match("^(%w+):(%a*)$")
+            local input = inputId and M.BY_ID[inputId]
+            local native = input and self:Replaceable(input, layer) and self:NativeBarButton(input, layer)
+            if native then wanted[native] = action end
+        end
+    end
+    for native, mark in pairs(marks) do
+        if not wanted[native] then mark:Hide() end
+    end
+    for native, action in pairs(wanted) do
+        local mark = marks[native]
+        if not mark then
+            -- An opaque round hides the game's picture, inside its ring
+            mark = CK.NewFrame("Frame", nil, native)
+            mark:SetAllPoints(native.icon or native)
+            mark.bg = mark:CreateTexture(nil, "ARTWORK")
+            mark.bg:SetPoint("TOPLEFT", 3, -3)
+            mark.bg:SetPoint("BOTTOMRIGHT", -3, 3)
+            mark.bg:SetColorTexture(0.04, 0.04, 0.04, 1)
+            mark.icon = mark:CreateTexture(nil, "OVERLAY")
+            -- The round the picture shows through
+            mark.round = { mark.bg, CK.NewFrame("Frame", nil, mark) }
+            mark.round[2]:SetPoint("TOPLEFT", 6, -6)
+            mark.round[2]:SetPoint("BOTTOMRIGHT", -6, 6)
+            marks[native] = mark
+        end
+        local square = isSquare(native)
+        shapeMark(mark, square)
+        mark:SetFrameLevel(native:GetFrameLevel() + 3)
+        local icon = self:ActionIcon(action)
+        -- (what it shows: Range.lua turns a spell out of range red)
+        mark.action = action
+        -- The game's own pictures (jump, ping...) come with their ring:
+        -- larger than the round, it stays outside. Square: the icon fills
+        -- the game's square, as its own icons do
+        local zoom = type(icon) == "table" and icon.atlas and -2 or (square and 3 or 6)
+        mark.icon:ClearAllPoints()
+        mark.icon:SetPoint("TOPLEFT", zoom, -zoom)
+        mark.icon:SetPoint("BOTTOMRIGHT", -zoom, zoom)
+        CK.Paddles.SetIcon(mark.icon, icon)
+        mark:Show()
+    end
+end
+
+-- /ec binds: the game's buttons replaced, and what each key runs now
+function M:Diagnose()
+    local manager = GamepadSharedUtility and GamepadSharedUtility.InputBindingManager
+    local stack = manager and manager.bindingSetStack
+    CK:Print(format(L.REPLACE_DIAG, tostring(self:ReplaceOn()), tostring(self:OwnKeys()),
+        tostring(InCombatLockdown()), tostring(self:CoreActive()))
+        .. format(" | pending %s, game sets %s", tostring(self.pending), stack and #stack or "?"))
+    -- What is saved, and whether it can be bound
+    for comboId, action in pairs(settings().replaced) do
+        local inputId, layer = comboId:match("^(%w+):(%a*)$")
+        local input = inputId and M.BY_ID[inputId]
+        DEFAULT_CHAT_FRAME:AddMessage(format("  %s = %s: %s, replaceable %s, key %s", comboId, action,
+            input and self:State(input, layer) or "?", tostring(input and self:Replaceable(input, layer)),
+            tostring(input and self:Combo(input, layer))))
+    end
+    if self.lastRelease then
+        DEFAULT_CHAT_FRAME:AddMessage("  released " .. self.lastRelease)
+    end
+    -- The chat keyboard's keys taken by something else while it was open
+    local taken = CK.lastTaken
+    if taken then
+        DEFAULT_CHAT_FRAME:AddMessage(format("  keyboard: %s taken by %s %.0f s ago, set again", taken.key,
+            tostring(taken.by), GetTime() - taken.time))
+    end
+    -- Each key bound: ours, what runs now, the game's own (its gamepad context)
+    local keys = {}
+    for combo in pairs(self.taken) do keys[#keys + 1] = combo end
+    table.sort(keys)
+    for _, combo in ipairs(keys) do
+        local now = GetBindingAction(combo, true)
+        local game
+        if C_KeyBindings and C_KeyBindings.GetBindingByKey and Enum and Enum.BindingContext then
+            local ok, value = pcall(C_KeyBindings.GetBindingByKey, combo, Enum.BindingContext.GamepadModeInGameCore)
+            game = ok and value or nil
+        end
+        local color = now == self.taken[combo] and "|cff6fd36f" or "|cffff6060"
+        DEFAULT_CHAT_FRAME:AddMessage(format("  %s%s|r: %s | now %s | game %s", color, combo,
+            tostring(self.taken[combo]), tostring(now), tostring(game)))
+    end
+    -- Fork CoolerMgdn: Create and the mic, each layer: what is saved, the
+    -- key it is bound on, ours there, what runs now, the game's own
+    for _, id in ipairs({ "CREATE", "MIC" }) do
+        local input = M.BY_ID[id]
+        if input then
+            for _, layer in ipairs(M.LAYERS) do
+                local combo = self:Combo(input, layer)
+                local game
+                if combo and C_KeyBindings and C_KeyBindings.GetBindingByKey and Enum and Enum.BindingContext then
+                    local ok, value = pcall(C_KeyBindings.GetBindingByKey, combo, Enum.BindingContext.GamepadModeInGameCore)
+                    game = ok and value or nil
+                end
+                local ours = combo and (self.bound[combo] or self.taken[combo])
+                local now = combo and GetBindingAction(combo, true)
+                local color = (ours and now == ours) and "|cff6fd36f" or "|cffff6060"
+                DEFAULT_CHAT_FRAME:AddMessage(format("  %s%s:%s|r = %s | key %s | ours %s | now %s | game %s",
+                    color, id, layer == "" and "-" or layer, tostring(self:Get(id, layer)), tostring(combo),
+                    tostring(ours), tostring(now), tostring(game)))
+            end
+        end
+    end
+end
+
+-- Labels of keys and pad buttons ("LB", "Start", "L4"...)
+local PAD_GLYPHS = {
+    PAD1 = "A", PAD2 = "B", PAD3 = "X", PAD4 = "Y", PADLSHOULDER = "LB", PADRSHOULDER = "RB",
+    PADLTRIGGER = "LT", PADRTRIGGER = "RT", PADLSTICK = "LS", PADRSTICK = "RS",
+    PADDUP = "DPAD_UP", PADDDOWN = "DPAD_DOWN", PADDLEFT = "DPAD_LEFT", PADDRIGHT = "DPAD_RIGHT",
+}
+local PAD_NAMES = { PADFORWARD = "START", PADBACK = "SELECT" }
+-- Fork CoolerMgdn: the pad's own buttons with the game's glyph for them
+local OWN_GLYPH = { PADSOCIAL = true, PAD5 = true }
+
+local function keyLabel(key)
+    if PAD_GLYPHS[key] then return CK:GlyphMarkup(PAD_GLYPHS[key], 16) end
+    local atlas = OWN_GLYPH[key] and CK.PadAtlas(key)
+    if atlas then return "|A:" .. atlas .. ":16:16|a" end
+    if PAD_NAMES[key] then return CK.ConfigKit.ChipText(PAD_NAMES[key]) end
+    local paddle = key:match("^PADPADDLE(%d)$")
+    if paddle then
+        for id, k in pairs(M.PADDLE_KEYS) do
+            if k == key then return id end
+        end
+    end
+    for _, id in ipairs(CK.Paddles.ALL) do
+        if settings().paddles[id] and settings().paddles[id].key == key then return id end
+    end
+    return GetBindingText and GetBindingText(key) or key
+end
+-- Fork CoolerMgdn: one button's name (the touchpad's mouse mode button)
+M.KeyLabel = keyLabel
+
+-- "RB + D-pad down": the panel's shortcut, a button held then another
+function M:ChordLabel(chord)
+    if not chord then return "-" end
+    return keyLabel(chord.hold) .. " + " .. keyLabel(chord.press)
+end
+
+---------------------------------------------------------------------------
+-- Events
+---------------------------------------------------------------------------
+function M:Init()
+    -- Paddle actions set before 0.5.0 lived with the paddles
+    for id, cfg in pairs(settings().paddles) do
+        if cfg.action then
+            settings().mapping[id .. ":"] = settings().mapping[id .. ":"] or cfg.action
+            cfg.action, cfg.cat = nil, nil
+        end
+    end
+    local events = CreateFrame("Frame")
+    events:RegisterEvent("PLAYER_ENTERING_WORLD")
+    events:RegisterEvent("PLAYER_REGEN_ENABLED")
+    events:RegisterEvent("CVAR_UPDATE")
+    -- A gamepad connected: the triggers' indexes the routers read
+    pcall(events.RegisterEvent, events, "GAME_PAD_CONNECTED")
+    pcall(events.RegisterEvent, events, "GAME_PAD_ACTIVE_CHANGED")
+    -- A stance or form learned (the stance bar's presses), a stance taken
+    -- (the Gamepad tab shows the stance bar's slots)
+    pcall(events.RegisterEvent, events, "UPDATE_SHAPESHIFT_FORMS")
+    pcall(events.RegisterEvent, events, "UPDATE_BONUS_ACTIONBAR")
+    events:SetScript("OnEvent", function(_, event, name)
+        if event == "UPDATE_BONUS_ACTIONBAR" then
+            if CK.Config and CK.Config:IsOpen() and not InCombatLockdown() then CK.Config:Render() end
+            return
+        end
+        if event == "UPDATE_SHAPESHIFT_FORMS" then
+            local has = CK.Paddles:HasStances()
+            if has == M.hadStances then return end
+            M.hadStances = has
+        end
+        if event == "CVAR_UPDATE" and not (name and (tostring(name):find("GamePadEmulate")
+            or tostring(name) == "GamepadStanceBarOverride" or tostring(name):lower() == "enablemouseovercast")) then return end
+        if event == "GAME_PAD_CONNECTED" or event == "GAME_PAD_ACTIVE_CHANGED" then
+            local lt, rt = padIndex("PADLTRIGGER"), padIndex("PADRTRIGGER")
+            if lt == M.ltIndex and rt == M.rtIndex then return end
+            M.ltIndex, M.rtIndex = lt, rt
+        end
+        -- Let the game set its own bindings first
+        C_Timer.After(event == "PLAYER_ENTERING_WORLD" and 1 or 0, function()
+            if event == "PLAYER_REGEN_ENABLED" then M:Repair() else M:Apply() end
+        end)
+    end)
+    -- The game sets its own pad bindings at many moments (its windows, its
+    -- targeting...), and an override binding replaces any other on its key:
+    -- after a change that isn't ours, check ours a moment later. Never more
+    -- than a few times in a row, should the game answer each of ours.
+    local recent = {}
+    local changed
+    function changed()
+        -- (Fork CoolerMgdn: ours, through Binds.lua: not the game rebinding)
+        if M.applying or M.repairQueued or InCombatLockdown() or (CK.Binds and CK.Binds.busy) then return end
+        local now = GetTime()
+        while recent[1] and recent[1] < now - 3 do table.remove(recent, 1) end
+        if #recent >= 6 then
+            if not M.repairLater then
+                M.repairLater = true
+                C_Timer.After(3, function()
+                    M.repairLater = false
+                    changed()
+                end)
+            end
+            return
+        end
+        M.repairQueued = true
+        C_Timer.After(0.15, function()
+            M.repairQueued = false
+            if not InCombatLockdown() and M:CoreActive() then
+                recent[#recent + 1] = GetTime()
+                M:Repair()
+            end
+        end)
+    end
+    for _, name in ipairs({ "SetOverrideBinding", "SetOverrideBindingClick", "SetOverrideBindingSpell",
+        "SetOverrideBindingItem", "SetOverrideBindingMacro", "ClearOverrideBindings" }) do
+        if _G[name] then hooksecurefunc(name, changed) end
+    end
+    -- The game's gamepad windows rebind the pad when they close
+    if EventRegistry and EventRegistry.RegisterCallback then
+        EventRegistry:RegisterCallback("Gamepad.RefreshFrameFocus", function()
+            C_Timer.After(0, function()
+                if InCombatLockdown() then return end
+                if M:CoreActive() then M:Repair() else M:Release() end
+            end)
+        end, M)
+    end
+end

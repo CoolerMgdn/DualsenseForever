@@ -1,0 +1,7 @@
+# CurseForge / BigWigs packager: what goes into the release archive
+package-as: DualsenseForever
+
+ignore:
+  - docs
+  - .gitignore
+  - .pkgmeta

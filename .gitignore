@@ -1,0 +1,8 @@
+# Release archives and editor leftovers
+*.zip
+*.bak
+*~
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

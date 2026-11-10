@@ -1,0 +1,1704 @@
+local _, CK = ...
+local L = CK.L
+
+-- Extra buttons (back paddles L4 / R4 / L5 / R5, L3 / R3) and helpers for the
+-- game's gamepad bar.
+--
+-- Steam Input sends the paddles as keyboard keys (F13-F16, F9-F12...), some
+-- controllers as gamepad buttons (PADPADDLE1-4): each paddle learns its key by
+-- being pressed once (configuration, Gamepad tab). What they do is set there
+-- like any free input (Mapping.lua).
+--
+-- The extra buttons that do something are drawn around the game's gamepad
+-- action bar, each where the player placed it, in the bar's round slot style:
+-- icon, count, cooldown, pressed look. The game's frames are only read; ours
+-- are plain, not secure: they show, hide and update in combat.
+local P = {}
+CK.Paddles = P
+
+-- The back paddles, in the order they are identified
+P.ORDER = { "L4", "R4", "L5", "R5" }
+-- Every input learning a key (the paddles, the touchpad buttons)
+P.ALL = { "L4", "R4", "L5", "R5", "TL1", "TL2", "TL3", "TL4", "TR1", "TR2", "TR3", "TR4" }
+
+-- The ones to identify: the paddles, then the touchpad buttons turned on
+function P:Order()
+    local M, list = CK.Mapping, {}
+    for _, id in ipairs(P.ALL) do
+        if M:InputEnabled(M.BY_ID[id]) then list[#list + 1] = id end
+    end
+    return list
+end
+
+-- The game's gamepad bars (no trigger, LT, RT, LT+RT) and their buttons:
+-- the D-pad group ("Left") and the face group ("Right"). The face buttons
+-- of the top bar are fixed (jump, interact, back, inspect).
+P.BARS = {
+    { key = "top", glyphs = {} },
+    { key = "left", glyphs = { "LT" } },
+    { key = "right", glyphs = { "RT" } },
+    { key = "bottom", glyphs = { "LT", "RT" } },
+}
+P.BUTTONS = {
+    { key = "left", group = "Left", index = 1, glyph = "DPAD_LEFT" },
+    { key = "up", group = "Left", index = 2, glyph = "DPAD_UP" },
+    { key = "right", group = "Left", index = 3, glyph = "DPAD_RIGHT" },
+    { key = "down", group = "Left", index = 4, glyph = "DPAD_DOWN" },
+    { key = "x", group = "Right", index = 1, glyph = "X" },
+    { key = "y", group = "Right", index = 2, glyph = "Y" },
+    { key = "b", group = "Right", index = 3, glyph = "B" },
+    { key = "a", group = "Right", index = 4, glyph = "A" },
+}
+
+local function settings() return CK.db.settings end
+
+local function enabled()
+    return CK.db and settings().modules.mapping
+end
+
+function P:Config(id)
+    local paddles = settings().paddles
+    paddles[id] = paddles[id] or {}
+    return paddles[id]
+end
+
+-- A paddle's key learned (pressed once when asked): until then the addon
+-- expects the controller's own paddle button, and a paddle Steam Input sends
+-- as a keyboard key does nothing (reported: forms on L4 / R4, never cast)
+function P:Identified(id)
+    local cfg = settings().paddles[id]
+    return type(cfg) == "table" and cfg.key ~= nil
+end
+
+-- Those given something to do but not identified (the paddles, the
+-- touchpad buttons turned on), in their order
+function P:Unidentified()
+    local M, list = CK.Mapping, {}
+    for _, id in ipairs(self:Order()) do
+        if not self:Identified(id) then
+            for _, layer in ipairs(M.LAYERS) do
+                if M:Get(id, layer) then
+                    list[#list + 1] = id
+                    break
+                end
+            end
+        end
+    end
+    return list
+end
+
+local function findBy(list, key)
+    for _, item in ipairs(list) do
+        if item.key == key then return item end
+    end
+end
+
+---------------------------------------------------------------------------
+-- The game's gamepad bar: "bar:<bar>:<button>"
+---------------------------------------------------------------------------
+-- The game's button for "bar:bottom:a" (nil while the gamepad bars are not loaded)
+function P:NativeButton(action)
+    local barKey, buttonKey = (action or ""):match("^bar:(%a+):(%a+)$")
+    local button = findBy(P.BUTTONS, buttonKey)
+    if not (barKey and button) then return end
+    local main = GamepadMainActionBarFrame
+    local bars = main and main.PageUnit and main.PageUnit.actionBars
+    local bar = bars and bars[barKey .. "Bar"]
+    local group = bar and bar[button.group]
+    return group and group["ActionButton" .. button.index]
+end
+
+-- The game's stance bar (stealth, druid forms, warrior stances): while the
+-- player is in one, it takes the place of one of the bars of the first
+-- page, with slots of its own (the game's gamepad settings, Stance bar:
+-- GamepadStanceBarOverride). The bar it takes: "left", "right", "bottom",
+-- or nil (none, or a bar of another page).
+local STANCE_BARS = { Page1LeftBar = "left", Page1RightBar = "right", Page1BottomBar = "bottom" }
+local STANCE_VALUES = { [2] = "left", [3] = "right", [4] = "bottom" }
+
+function P:StanceBarKey()
+    local value = tonumber(GetCVar("GamepadStanceBarOverride"))
+    if not value then return nil end
+    local enum = Enum and Enum.GamepadStanceBarOverride
+    if not enum then return STANCE_VALUES[value] end
+    for key, bar in pairs(STANCE_BARS) do
+        if enum[key] == value then return bar end
+    end
+end
+
+local function stanceBar()
+    local main = GamepadMainActionBarFrame
+    local bars = main and main.PageUnit and main.PageUnit.actionBars
+    return bars and bars.stanceBar
+end
+
+-- A character that has stances or forms (the others' bars never change)
+function P:HasStances()
+    return (GetNumShapeshiftForms and GetNumShapeshiftForms() or 0) > 0
+end
+
+-- The stance bar's button in the place of a bar's button ("bar:right:a"),
+-- when the stance bar takes that bar
+function P:StanceButton(action)
+    local barKey, buttonKey = (action or ""):match("^bar:(%a+):(%a+)$")
+    local button = findBy(P.BUTTONS, buttonKey)
+    if not (barKey and button) or barKey ~= self:StanceBarKey() then return end
+    local bar = stanceBar()
+    local group = bar and bar[button.group]
+    return group and group["ActionButton" .. button.index]
+end
+
+-- The button the game shows there now: the stance bar's while the player is
+-- in a stance (stealth...) on the first page, else the bar's own
+function P:LiveButton(action)
+    local stance = self:StanceButton(action)
+    local bar = stanceBar()
+    if stance and bar and bar.isOverrideBarActive then
+        local tracker = GamepadMainActionBarFrame.PageUnit.PageTracker
+        if (tracker and tracker.currentPage or 1) == 1 then return stance end
+    end
+    return self:NativeButton(action)
+end
+
+-- Action slot the game's button shown there holds (the stance bar's in a stance)
+function P:NativeSlot(action)
+    local native = self:LiveButton(action)
+    local slot = native and native.action
+    if type(slot) == "number" and slot > 0 then return slot end
+end
+
+local function hasAction(slot)
+    if C_ActionBar and C_ActionBar.HasAction then return C_ActionBar.HasAction(slot) end
+    return HasAction and HasAction(slot)
+end
+
+function P.SlotTexture(slot)
+    if not (slot and hasAction(slot)) then return nil end
+    if C_ActionBar and C_ActionBar.GetActionTexture then return C_ActionBar.GetActionTexture(slot) end
+    return GetActionTexture and GetActionTexture(slot)
+end
+
+-- Name of what an action slot holds (spell, item, macro, mount...)
+function P.SlotName(slot)
+    if not (slot and hasAction(slot)) then return nil end
+    local kind, id = GetActionInfo(slot)
+    if kind == "spell" then
+        if C_Spell and C_Spell.GetSpellName then return C_Spell.GetSpellName(id) end
+        return GetSpellInfo and (GetSpellInfo(id))
+    elseif kind == "item" then
+        if C_Item and C_Item.GetItemNameByID then return C_Item.GetItemNameByID(id) end
+        return GetItemInfo and (GetItemInfo(id))
+    elseif kind == "macro" then
+        return GetActionText and GetActionText(slot) or (GetMacroInfo and (GetMacroInfo(id)))
+    elseif kind == "summonmount" and C_MountJournal and C_MountJournal.GetMountInfoByID then
+        return (C_MountJournal.GetMountInfoByID(id))
+    elseif kind == "flyout" then
+        -- The game's pop-out menus (hunter aspects, tracking, pets...)
+        local name
+        if C_Flyout and C_Flyout.GetFlyoutInfo then
+            local ok, info = pcall(C_Flyout.GetFlyoutInfo, id)
+            name = ok and type(info) == "table" and info.name
+        end
+        if not name and GetFlyoutInfo then name = GetFlyoutInfo(id) end
+        if name and name ~= "" then return name end
+    elseif kind == "summonpet" and C_PetJournal and C_PetJournal.GetPetInfoByPetID then
+        local _, customName, _, _, _, _, _, petName = C_PetJournal.GetPetInfoByPetID(id)
+        return customName or petName
+    end
+    local text = GetActionText and GetActionText(slot)
+    if text and text ~= "" then return text end
+    -- Anything else: the first line of its tooltip
+    if C_TooltipInfo and C_TooltipInfo.GetAction then
+        local ok, data = pcall(C_TooltipInfo.GetAction, slot)
+        local line = ok and type(data) == "table" and data.lines and data.lines[1]
+        local left = line and line.leftText
+        if type(left) == "string" and not (issecretvalue and issecretvalue(left)) and left ~= "" then return left end
+    end
+end
+
+function P:CommandName(command)
+    local name = GetBindingName and GetBindingName(command)
+    if not name or name == command then name = _G["BINDING_NAME_" .. command] end
+    return name or command
+end
+
+-- "LT RT" glyphs of a layer ("" = no trigger)
+function P:LayerLabel(layer, size)
+    if layer == "" then return L.MAP_ALONE end
+    local parts = {}
+    if layer:find("LT", 1, true) then parts[#parts + 1] = CK:GlyphMarkup("LT", size or 18) end
+    if layer:find("RT", 1, true) then parts[#parts + 1] = CK:GlyphMarkup("RT", size or 18) end
+    return table.concat(parts, " ")
+end
+
+-- Glyphs of a bar button: "LT RT + A"
+function P:BarLabel(action)
+    local barKey, buttonKey = (action or ""):match("^bar:(%a+):(%a+)$")
+    local bar, button = findBy(P.BARS, barKey), findBy(P.BUTTONS, buttonKey)
+    if not (bar and button) then return "?" end
+    local parts = {}
+    for _, glyph in ipairs(bar.glyphs) do parts[#parts + 1] = CK:GlyphMarkup(glyph, 18) end
+    local label = table.concat(parts, "")
+    if label ~= "" then label = label .. " + " end
+    return label .. CK:GlyphMarkup(button.glyph, 18)
+end
+
+-- Glyphs and what the game's button holds
+function P:ActionLabel(action)
+    local name = P.SlotName(self:NativeSlot(action))
+    return format("%s  |cffffffff%s|r", self:BarLabel(action), name or L.MAP_EMPTY_SLOT)
+end
+
+function P:ActionIcon(action)
+    return P.SlotTexture(self:NativeSlot(action))
+end
+
+---------------------------------------------------------------------------
+-- Learning a paddle's key: press it once
+---------------------------------------------------------------------------
+local IGNORED_KEYS = {
+    LSHIFT = true, RSHIFT = true, LCTRL = true, RCTRL = true, LALT = true, RALT = true,
+    LMETA = true, RMETA = true, UNKNOWN = true,
+}
+
+-- Gamepad buttons the game already uses: never taken as a paddle
+local function isStandardPadButton(button)
+    return button:find("^PAD%d$") or button:find("^PADD") or button:find("^PAD[LR]STICK")
+        or button:find("^PAD[LR]SHOULDER") or button:find("^PAD[LR]TRIGGER")
+        or button == "PADBACK" or button == "PADFORWARD" or button == "PADSYSTEM"
+end
+
+function P:StopCapture(key)
+    local f = self.captureFrame
+    if not (f and f:IsShown()) then return end
+    f:Hide()
+    if f.timer then f.timer:Cancel() end
+    if not InCombatLockdown() then
+        f:EnableKeyboard(false)
+        if f.EnableGamePadButton then f:EnableGamePadButton(false) end
+    end
+    local id, onDone = f.id, f.onDone
+    f.id, f.onDone = nil, nil
+    if key then
+        -- One key per paddle (learned or by default): the paddle on it takes
+        -- this one's key in exchange
+        local M = CK.Mapping
+        local was = M:InputKey(M.BY_ID[id])
+        for _, other in ipairs(P.ALL) do
+            if other ~= id and M:InputKey(M.BY_ID[other]) == key then self:Config(other).key = was end
+        end
+        local previous = GetBindingAction and GetBindingAction(key)
+        if previous and previous ~= "" then
+            CK:Print(L.PADDLE_KEY_REPLACES, GetBindingText and GetBindingText(key) or key, self:CommandName(previous))
+        end
+        self:Config(id).key = key
+        CK.Mapping:Apply()
+        self:Apply()
+    end
+    if onDone then onDone(key) end
+end
+
+function P:Capture(id, onDone)
+    if CK:BlockedByCombat() then return end
+    local f = self.captureFrame
+    if not f then
+        f = CK.NewFrame("Frame", nil, UIParent)
+        f:SetFrameStrata("FULLSCREEN_DIALOG")
+        f:SetSize(1, 1)
+        f:SetPoint("CENTER")
+        f:SetScript("OnKeyDown", function(_, key)
+            if IGNORED_KEYS[key] then return end
+            if key == "ESCAPE" then return CK.Config:PressFromCapture("ESCAPE") end
+            P:StopCapture(key)
+        end)
+        if f.EnableGamePadButton then
+            f:SetScript("OnGamePadButtonDown", function(_, button)
+                if not isStandardPadButton(button) then
+                    P:StopCapture(button)
+                elseif button == "PAD2" or button == "PAD3" then
+                    CK.Config:PressFromCapture(button)
+                end
+                return false
+            end)
+        end
+        f:Hide()
+        self.captureFrame = f
+    end
+    self:StopCapture(nil)
+    f.id, f.onDone = id, onDone
+    f:EnableKeyboard(true)
+    f:SetPropagateKeyboardInput(false)
+    if f.EnableGamePadButton then f:EnableGamePadButton(true) end
+    f:Show()
+    f.timer = C_Timer.NewTimer(10, function() P:StopCapture(nil) end)
+end
+
+function P:IsCapturing(id)
+    local f = self.captureFrame
+    return f and f:IsShown() and (id == nil or f.id == id) or false
+end
+
+---------------------------------------------------------------------------
+-- The extra buttons on screen (back paddles, L3 / R3), next to the game's
+-- gamepad action bar
+---------------------------------------------------------------------------
+local SIZE = 38
+P.PS_SIZE = 28
+local PRESSED = 4       -- the game's buttons shrink by 4 px when pressed
+
+-- Each one has its own place, relative to the game's left / right bar (both
+-- on the bottom bar in the compact layout); the right side mirrors the left
+P.EXTRA = { "L4", "L5", "L3", "R4", "R5", "R3", "TL1", "TL2", "TL3", "TL4", "TR1", "TR2", "TR3", "TR4",
+    "CREATE", "MIC" }
+-- Fork CoolerMgdn: a PlayStation pad's Create and mic too, with what they
+-- run (an option: Home › Gamepad), their glyphs the game's own
+local SIDE = { L4 = -1, L5 = -1, L3 = -1, R4 = 1, R5 = 1, R3 = 1,
+    TL1 = -1, TL2 = -1, TL3 = -1, TL4 = -1, TR1 = 1, TR2 = 1, TR3 = 1, TR4 = 1, CREATE = -1, MIC = 1 }
+local PARTNER = { L4 = "R4", R4 = "L4", L5 = "R5", R5 = "L5", L3 = "R3", R3 = "L3",
+    TL1 = "TR1", TR1 = "TL1", TL2 = "TR2", TR2 = "TL2", TL3 = "TR3", TR3 = "TL3", TL4 = "TR4", TR4 = "TL4",
+    CREATE = "MIC", MIC = "CREATE" }
+P.DEFAULT_POS = {
+    L4 = { x = -182, y = 26 }, L5 = { x = -182, y = -26 }, L3 = { x = -65, y = -78 },
+    R4 = { x = 182, y = 26 }, R5 = { x = 182, y = -26 }, R3 = { x = 65, y = -78 },
+    CREATE = { x = -104, y = -78 }, MIC = { x = 104, y = -78 },
+    -- The touchpad buttons: the outer column
+    TL1 = { x = -234, y = 52 }, TL2 = { x = -234, y = 26 }, TL3 = { x = -234, y = 0 }, TL4 = { x = -234, y = -26 },
+    TR1 = { x = 234, y = 52 }, TR2 = { x = 234, y = 26 }, TR3 = { x = 234, y = 0 }, TR4 = { x = 234, y = -26 },
+}
+
+local function atlasOr(tex, atlas, fallback)
+    if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(atlas) then
+        tex:SetAtlas(atlas)
+    elseif fallback then
+        tex:SetTexture(fallback)
+    else
+        tex:Hide()
+    end
+end
+P.atlasOr = atlasOr
+
+-- An icon: a texture or file ID (zoomed in a little, like the game's buttons,
+-- so square edges never show in the round slot), { atlas = "..." } or
+-- { glyph = "A" } (the gamepad button's own picture)
+function P.SetIcon(tex, icon)
+    if type(icon) == "table" then
+        if icon.atlas and C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(icon.atlas) then
+            tex:SetAtlas(icon.atlas)
+        elseif icon.glyph then
+            CK:SetGlyph(tex, icon.glyph)
+        elseif icon.texture then
+            tex:SetTexture(icon.texture)
+            tex:SetTexCoord(0, 1, 0, 1)
+        else
+            tex:Hide()
+            return
+        end
+        tex:Show()
+    elseif icon then
+        tex:SetTexture(icon)
+        tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        tex:Show()
+    else
+        tex:Hide()
+    end
+end
+
+-- A round slot in the style of the game's gamepad bar: icon, cooldown,
+-- count, border, pressed look. Shared with the mapping page. The visuals sit
+-- in `b.visual`, which shrinks when pressed while `b` keeps its place.
+function P:CreateSlot(parent, size)
+    local b = CK.NewFrame("Frame", nil, parent)
+    b:SetSize(size, size)
+    b.size = size
+    local v = CK.NewFrame("Frame", nil, b)
+    v:SetPoint("CENTER")
+    v:SetSize(size, size)
+    b.visual = v
+
+    local shadow = v:CreateTexture(nil, "BACKGROUND", nil, -2)
+    shadow:SetPoint("TOPLEFT", -4, 4)
+    shadow:SetPoint("BOTTOMRIGHT", 4, -4)
+    atlasOr(shadow, "gamepad-actionbar-circleslot-dropshadow")
+    -- Dark round background: an empty slot, like the game's
+    local empty = v:CreateTexture(nil, "BACKGROUND", nil, -1)
+    empty:SetPoint("TOPLEFT", 3, -3)
+    empty:SetPoint("BOTTOMRIGHT", -3, 3)
+    empty:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask")
+    empty:SetVertexColor(0, 0, 0, 0.6)
+
+    b.icon = v:CreateTexture(nil, "BACKGROUND")
+    b.icon:SetPoint("TOPLEFT", 3, -3)
+    b.icon:SetPoint("BOTTOMRIGHT", -3, 3)
+    b.mask = v:CreateMaskTexture()
+    b.mask:SetAllPoints(b.icon)
+    if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo("CircleMask") then
+        b.mask:SetAtlas("CircleMask")
+    else
+        b.mask:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask", "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+    end
+    b.icon:AddMaskTexture(b.mask)
+
+    b.cooldown = CK.NewFrame("Cooldown", nil, v, "CooldownFrameTemplate")
+    b.cooldown:SetAllPoints(b.icon)
+    b.cooldown:SetSwipeTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask")
+    b.cooldown:SetSwipeColor(0, 0, 0, 0.7)
+    b.cooldown:SetDrawEdge(false)
+    b.cooldown:SetDrawBling(false)
+    if b.cooldown.SetUseCircularEdge then b.cooldown:SetUseCircularEdge(true) end
+
+    -- Above the cooldown swipe
+    local over = CK.NewFrame("Frame", nil, v)
+    over:SetAllPoints()
+    over:SetFrameLevel(b.cooldown:GetFrameLevel() + 2)
+    b.over = over
+    b.border = over:CreateTexture(nil, "ARTWORK")
+    b.border:SetAllPoints()
+    atlasOr(b.border, "gamepad-actionbar-circleslot-border-normal", "Interface\\Minimap\\MiniMap-TrackingBorder")
+    b.pressed = over:CreateTexture(nil, "ARTWORK", nil, 1)
+    b.pressed:SetAllPoints()
+    atlasOr(b.pressed, "gamepad-actionbar-circleslot-border-pressed")
+    b.pressed:Hide()
+    b.count = over:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    b.count:SetPoint("BOTTOMRIGHT", -2, 2)
+    return b
+end
+
+-- Pressed look, like the game's buttons: a little smaller and lower, with
+-- the pressed rim
+function P.SetPressed(b, down)
+    if b.isPressed == down then return end
+    b.isPressed = down
+    b.visual:SetSize(down and b.size - PRESSED or b.size, down and b.size - PRESSED or b.size)
+    b.visual:ClearAllPoints()
+    b.visual:SetPoint("CENTER", 0, down and -PRESSED / 2 or 0)
+    b.pressed:SetShown(down)
+end
+
+-- A text badge ("L4") on a slot, where the game puts its button glyphs
+function P:AddBadge(b, text, side)
+    local badge = CK.NewFrame("Frame", nil, b.over)
+    badge:SetSize(24, 24)
+    b.side = side
+    local bg = badge:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    atlasOr(bg, "gamepad-actionbar-slot-bg-empty")
+    -- Fork CoolerMgdn: a button of the pad's own (Create, the mic): the
+    -- game's glyph for it, not its name
+    local input = CK.Mapping.BY_ID[text]
+    local atlas = input and input.ps and CK.PadAtlas(input.key)
+    -- Fork CoolerMgdn (asked): L3 / R3 with the stick's glyph too, the
+    -- game's own (its binding text's), else ours
+    local stick = (text == "L3" and "LS") or (text == "R3" and "RS") or nil
+    if stick and input then atlas = CK.PadAtlas(input.key) end
+    if atlas or stick then
+        badge:SetSize(20, 20)
+        local g = badge:CreateTexture(nil, "OVERLAY")
+        g:SetPoint("CENTER", 0, 0)
+        g:SetSize(stick and 18 or 15, stick and 18 or 15)
+        if atlas then
+            g:SetAtlas(atlas)
+        else
+            pcall(CK.SetGlyph, CK, g, stick)
+        end
+    else
+        local fs = badge:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        fs:SetPoint("CENTER", 0, 0)
+        fs:SetText(text)
+    end
+    -- Above every button, so a neighbour never hides a name
+    badge:SetFrameLevel(b.over:GetFrameLevel() + 20)
+    b.badge = badge
+    P.PlaceBadge(b, "outer")
+end
+
+-- The badge on the outer side, horizontally (left for L4, right for R4) or
+-- vertically (above for a button above the bar's middle, below for one
+-- below it), above, below, left, right, or hidden (option)
+P.BADGE_PLACES = { "outer", "outer_v", "top", "bottom", "left", "right", "hidden" }
+
+function P.PlaceBadge(b, where, y)
+    local badge = b.badge
+    if not badge then return end
+    if where == "outer_v" and y and y ~= 0 then where = y > 0 and "top" or "bottom" end
+    if where == "outer" or where == "outer_v" then where = (b.side or -1) < 0 and "left" or "right" end
+    badge:ClearAllPoints()
+    badge:SetShown(where ~= "hidden")
+    if where == "top" then
+        badge:SetPoint("BOTTOM", b, "TOP", 0, -8)
+    elseif where == "bottom" then
+        badge:SetPoint("TOP", b, "BOTTOM", 0, 8)
+    elseif where == "right" then
+        badge:SetPoint("LEFT", b, "RIGHT", -8, 0)
+    else
+        badge:SetPoint("RIGHT", b, "LEFT", 8, 0)
+    end
+end
+
+-- Cooldowns can be secret values in combat: hand them over untouched
+function P.ApplyCooldown(cd, action)
+    local kind, value = (action or ""):match("^(%a+):(.+)$")
+    -- A party spell: its spell's cooldown
+    local party = CK.Mapping and CK.Mapping.PartySpell and CK.Mapping.PartySpell(action)
+    if party then kind, value = "spell", tostring(party) end
+    local ok
+    if kind == "bar" then
+        local slot = P:NativeSlot(action)
+        if slot and hasAction(slot) then
+            if C_ActionBar.GetActionCooldownDuration and cd.SetCooldownFromDurationObject then
+                ok = pcall(function() cd:SetCooldownFromDurationObject(C_ActionBar.GetActionCooldownDuration(slot)) end)
+            end
+            ok = ok or pcall(function()
+                local info = C_ActionBar.GetActionCooldown(slot)
+                if info and info.isActive then cd:SetCooldown(info.startTime, info.duration, info.modRate) else cd:Clear() end
+            end)
+        end
+    elseif kind == "spell" and C_Spell then
+        local id = tonumber(value)
+        if C_Spell.GetSpellCooldownDuration and cd.SetCooldownFromDurationObject then
+            ok = pcall(function() cd:SetCooldownFromDurationObject(C_Spell.GetSpellCooldownDuration(id)) end)
+        end
+        ok = ok or pcall(function()
+            local info = C_Spell.GetSpellCooldown(id)
+            if info and info.isActive ~= false and info.duration and info.duration > 0 then
+                cd:SetCooldown(info.startTime, info.duration, info.modRate)
+            else
+                cd:Clear()
+            end
+        end)
+    elseif kind == "item" and C_Item and C_Item.GetItemCooldown then
+        ok = pcall(function()
+            local start, duration, enable = C_Item.GetItemCooldown(tonumber(value))
+            if enable and duration and duration > 0 then cd:SetCooldown(start, duration) else cd:Clear() end
+        end)
+    end
+    if not ok then cd:Clear() end
+end
+
+---------------------------------------------------------------------------
+-- Which layer is held, and which inputs are pressed
+---------------------------------------------------------------------------
+local MOD_DOWN = { SHIFT = IsShiftKeyDown, CTRL = IsControlKeyDown, ALT = IsAltKeyDown }
+
+local function padState()
+    if not (C_GamePad and C_GamePad.GetDeviceMappedState) then return nil end
+    local id = C_GamePad.GetActiveDeviceID and C_GamePad.GetActiveDeviceID()
+    return id and C_GamePad.GetDeviceMappedState(id)
+end
+
+local function padButtonDown(state, button)
+    if not (state and state.buttons and C_GamePad.ButtonBindingToIndex) then return false end
+    local index = C_GamePad.ButtonBindingToIndex(button)
+    return index ~= nil and state.buttons[index + 1] and true or false
+end
+
+-- "", "LT", "RT" or "LTRT": the triggers held (or toggled, Toggle.lua)
+function P.HeldLayer()
+    if CK.Toggle and CK.Toggle:On() and CK.Toggle.header then return CK.Toggle:Layer() end
+    local state = padState()
+    local function held(button)
+        local mod = CK.Mapping:TriggerModifier(button)
+        if mod and MOD_DOWN[mod] and MOD_DOWN[mod]() then return true end
+        return padButtonDown(state, button)
+    end
+    return (held("PADLTRIGGER") and "LT" or "") .. (held("PADRTRIGGER") and "RT" or "")
+end
+
+-- Keyboard keys (paddles sent by Steam Input) seen going down by a frame
+-- that lets every key through. Each press shows for a moment at least; the
+-- release is never waited for (it does not always reach us), the key is
+-- read as held from the game itself.
+local PRESS_TIME = 0.15
+-- A press while the last one still shows: a short release first, so that
+-- each press shows (reported: pressed several times, shown once)
+local GAP = 0.05
+local keyPressed, keyGap = {}, {}
+local function watchKeys()
+    if P.keyWatcher or InCombatLockdown() then return end
+    local w = CK.NewFrame("Frame", nil, UIParent)
+    w:SetSize(1, 1)
+    w:SetPoint("TOPLEFT")
+    w:EnableKeyboard(true)
+    w:SetPropagateKeyboardInput(true)
+    w:SetScript("OnKeyDown", function(_, key)
+        local now = GetTime()
+        if (keyPressed[key] or 0) > now then keyGap[key] = now + GAP end
+        keyPressed[key] = math.max(now, keyGap[key] or 0) + PRESS_TIME
+    end)
+    P.keyWatcher = w
+end
+
+local function inputDown(key, state, now)
+    if not key or (keyGap[key] or 0) > now then return false end
+    if (keyPressed[key] or 0) > now then return true end
+    if IsKeyDown and IsKeyDown(key) then return true end
+    return key:find("^PAD") ~= nil and padButtonDown(state, key)
+end
+
+-- Our secure buttons (spells, items, macros) tell when they are clicked;
+-- the trigger toggle's icons show it too
+local flashed, gapUntil = {}, {}
+function P:NotifyPress(inputId)
+    local now = GetTime()
+    if (flashed[inputId] or 0) > now then gapUntil[inputId] = now + GAP end
+    flashed[inputId] = math.max(now, gapUntil[inputId] or 0) + PRESS_TIME
+    if CK.Toggle and CK.Toggle.Pressed then CK.Toggle:Pressed(inputId) end
+end
+
+---------------------------------------------------------------------------
+-- Drawing
+---------------------------------------------------------------------------
+-- The action shown: the one the held layer runs
+function P:ShownAction(id, layer)
+    local M = CK.Mapping
+    local input = M.BY_ID[id]
+    local action = M:EffectiveAction(input, layer or "")
+    -- Fork CoolerMgdn: Create / the mic, put over the game's own function
+    -- (saved among the replaced buttons): shown too (found: L2 + R2 +
+    -- Create ran its spell, the badge showed nothing)
+    if not action and input and input.ps then action = M:GetReplaced(id, layer or "") end
+    return action
+end
+
+local function hasAnyAction(id)
+    local M = CK.Mapping
+    local input = M.BY_ID[id]
+    for _, layer in ipairs(M.LAYERS) do
+        if M:Get(id, layer) then return true end
+        if input and input.ps and M:GetReplaced(id, layer) then return true end
+    end
+end
+
+-- L3 / R3: shown with what the game does with them (autorun, ping...) when
+-- nothing of ours is on them
+local STICKS = { L3 = true, R3 = true }
+
+function P:NativeStick(id, layer)
+    if not STICKS[id] then return nil end
+    local M = CK.Mapping
+    local input = M.BY_ID[id]
+    local name, icon
+    if layer ~= "" and M:State(input, layer) == "native" then name, icon = M:NativeInfo(input, layer) end
+    if not name and M:State(input, "") == "native" then name, icon = M:NativeInfo(input, "") end
+    return name, icon
+end
+
+function P:UpdateButton(b, cooldown, layer, state)
+    local action = self:ShownAction(b.id, layer or "")
+    if action then
+        P.SetIcon(b.icon, CK.Mapping:ActionIcon(action))
+    else
+        local _, icon = self:NativeStick(b.id, layer or "")
+        P.SetIcon(b.icon, icon)
+    end
+    local slot = action and action:find("^bar:") and self:NativeSlot(action)
+    if slot and hasAction(slot) then
+        local usable, noMana = (C_ActionBar.IsUsableAction or IsUsableAction)(slot)
+        if usable then
+            b.icon:SetVertexColor(1, 1, 1)
+        elseif noMana then
+            b.icon:SetVertexColor(0.5, 0.5, 1)
+        else
+            b.icon:SetVertexColor(0.4, 0.4, 0.4)
+        end
+        local ok, count = pcall(C_ActionBar.GetActionDisplayCount, slot)
+        b.count:SetText(ok and count or "")
+    else
+        b.icon:SetVertexColor(1, 1, 1)
+        local id = action and tonumber(action:match("^item:(%d+)$") or "")
+        b.count:SetText(id and C_Item.GetItemCount and C_Item.GetItemCount(id) or "")
+    end
+    -- Out of range: the whole spell in red (option)
+    local Range = CK.Range
+    if Range and Range.On() then
+        local out
+        if slot and hasAction(slot) then
+            out = Range.InRange(slot) == false
+        else
+            local spell = action and tonumber(action:match("^spell:(%d+)$") or "")
+            if spell and C_Spell and C_Spell.IsSpellInRange and UnitExists("target") then
+                out = C_Spell.IsSpellInRange(spell, "target") == false
+            end
+        end
+        if out then b.icon:SetVertexColor(Range.RED[1], Range.RED[2], Range.RED[3]) end
+    end
+    if cooldown or action ~= b.action or slot ~= b.slot then
+        b.action, b.slot = action, slot
+        P.ApplyCooldown(b.cooldown, action)
+    end
+end
+
+-- Always one of the fixed places (an older free place goes to the nearest)
+function P:Position(id)
+    local nearestPlace = P.NearestPlace
+    local pos = settings().extraPos[id]
+    if type(pos) ~= "table" or type(pos.x) ~= "number" or type(pos.y) ~= "number" then pos = P.DEFAULT_POS[id] end
+    if settings().extraFree then return pos.x, pos.y end
+    return nearestPlace(SIDE[id], pos.x, pos.y)
+end
+
+-- In the compact layout the game puts every bar on the bottom one: its side
+-- anchors move there, and so do the buttons (anchoring plain frames to the
+-- game's frames changes nothing for them)
+function P:Layout()
+    local f = self.frame
+    if not f then return end
+    local unit = GamepadMainActionBarFrame and GamepadMainActionBarFrame.PageUnit
+    for _, id in ipairs(P.EXTRA) do
+        local b = f.buttons[id]
+        local x, y = self:Position(id)
+        b:ClearAllPoints()
+        local anchor = unit and (SIDE[id] < 0 and unit.LeftCenteredAnchor or unit.RightCenteredAnchor)
+        if anchor then
+            b:SetPoint("CENTER", anchor, "CENTER", x, y)
+        else
+            b:SetPoint("CENTER", f, "CENTER", x + SIDE[id] * 195, y)
+        end
+        -- Its name follows its place (outer side, up / down)
+        P.PlaceBadge(b, settings().badgePlace or "outer", y)
+    end
+end
+
+-- Shown with the game's gamepad action bar: the buttons that do something
+-- (all of them while placing)
+function P:UpdateVisibility()
+    local f = self.frame
+    if not f then return end
+    local bar = GamepadMainActionBarFrame
+    for _, id in ipairs(P.EXTRA) do
+        local show
+        if STICKS[id] then
+            show = settings().features.showSticks
+        else
+            show = hasAnyAction(id)
+        end
+        local input = CK.Mapping.BY_ID[id]
+        -- (Create and the mic: an option)
+        if input.ps and settings().features.extraPadButtons == false then show = false end
+        f.buttons[id]:SetShown(CK.Mapping:InputEnabled(input) and (self.placing or show) or false)
+    end
+    local on = enabled() and settings().features.extraDisplay
+    f:SetShown((self.placing or (on and bar ~= nil and bar:IsVisible())) and true or false)
+end
+
+-- A button with nothing in the layer on screen isn't drawn (reported: next
+-- to buttons hidden for having nothing at all, others showed an empty
+-- circle for having something in another layer only). Faded out, not
+-- hidden: it keeps its place for the party wheel opened on it and for
+-- Move / size. The sticks keep the game's function they show.
+function P:Refresh(cooldown)
+    local f = self.frame
+    if not (f and f:IsShown()) then return end
+    local layer = P.HeldLayer()
+    for _, id in ipairs(P.EXTRA) do
+        local b = f.buttons[id]
+        if b:IsShown() then
+            self:UpdateButton(b, cooldown, layer)
+            local empty = not self.placing and not STICKS[id] and not b.action
+            b:SetAlpha(empty and 0 or 1)
+            b:EnableMouse(not empty)
+        end
+    end
+end
+
+-- Every frame: the pressed look follows the input
+function P:UpdatePressed()
+    local f = self.frame
+    local state = padState()
+    local now = GetTime()
+    for _, id in ipairs(P.EXTRA) do
+        local b = f.buttons[id]
+        if b:IsShown() then
+            local key = CK.Mapping:InputKey(CK.Mapping.BY_ID[id])
+            local gap = (gapUntil[id] or 0) > now
+            P.SetPressed(b, not gap and (inputDown(key, state, now) or (flashed[id] or 0) > now))
+        end
+    end
+end
+
+function P:AttachToBar()
+    local bar = GamepadMainActionBarFrame
+    if not bar or self.attached then return end
+    self.attached = true
+    local f = self.frame
+    -- Anchored to the game's bar, never parented to it nor changing it
+    f:ClearAllPoints()
+    f:SetPoint("CENTER", bar, "CENTER")
+    bar:HookScript("OnShow", function() P:UpdateVisibility() end)
+    bar:HookScript("OnHide", function() P:UpdateVisibility() end)
+end
+
+local function tooltip(b)
+    if P.placing then return end
+    local layer = P.HeldLayer()
+    local action = P:ShownAction(b.id, layer)
+    GameTooltip:SetOwner(b, SIDE[b.id] < 0 and "ANCHOR_LEFT" or "ANCHOR_RIGHT")
+    local slot = action and action:find("^bar:") and P:NativeSlot(action)
+    if slot and hasAction(slot) then
+        GameTooltip:SetAction(slot)
+    else
+        local name = CK.Mapping:ActionName(action) or P:NativeStick(b.id, layer)
+        GameTooltip:SetText(name or L.MAP_FREE, 1, 1, 1)
+    end
+    local key = CK.Mapping:InputKey(CK.Mapping.BY_ID[b.id])
+    GameTooltip:AddLine(format("%s: %s", b.id, GetBindingText and GetBindingText(key) or key), 0.6, 0.6, 0.6)
+    GameTooltip:Show()
+end
+
+function P:BuildFrame()
+    if self.frame then return end
+    local f = CK.NewFrame("Frame", nil, UIParent)
+    f:SetSize(1, 1)
+    f:SetPoint("BOTTOM", UIParent, "BOTTOM", 0, 211)
+    -- Above the game's gamepad bar (LOW): buttons and names placed over its
+    -- top and bottom bars stay visible
+    f:SetFrameStrata("MEDIUM")
+    f.buttons = {}
+    for _, id in ipairs(P.EXTRA) do
+        -- Fork CoolerMgdn (asked): Create and the mic smaller than the rest
+        local input = CK.Mapping.BY_ID[id]
+        local b = self:CreateSlot(f, input and input.ps and P.PS_SIZE or SIZE)
+        b.id = id
+        self:AddBadge(b, id, SIDE[id])
+        b.ring = b.over:CreateTexture(nil, "OVERLAY")
+        b.ring:SetPoint("TOPLEFT", -6, 6)
+        b.ring:SetPoint("BOTTOMRIGHT", 6, -6)
+        atlasOr(b.ring, "gamepad-actionbar-circleslot-border-selected", "Interface\\Minimap\\MiniMap-TrackingBorder")
+        b.ring:SetVertexColor(1, 0.85, 0.3)
+        b.ring:Hide()
+        b:EnableMouse(true)
+        b:SetScript("OnEnter", tooltip)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        b:SetScript("OnMouseDown", function(self)
+            if not P.placing then return end
+            P:SelectForPlacement(self.id)
+            if settings().extraFree then P:StartDrag(self) end
+        end)
+        b:SetScript("OnMouseUp", function() P.drag = nil end)
+        f.buttons[id] = b
+    end
+    local elapsed = 0
+    f:SetScript("OnUpdate", function(_, dt)
+        P:UpdatePressed()
+        if P.drag then P:Drag() end
+        elapsed = elapsed + dt
+        if elapsed < 0.1 then return end
+        elapsed = 0
+        -- Same scale and fading as the game's bar
+        local bar = GamepadMainActionBarFrame
+        if bar then
+            f:SetScale(bar:GetEffectiveScale() / UIParent:GetEffectiveScale())
+            f:SetAlpha(P.placing and 1 or bar:GetEffectiveAlpha() / math.max(0.01, UIParent:GetEffectiveAlpha()))
+        end
+        P:Refresh(false)
+    end)
+    f:SetScript("OnShow", function() P:Refresh(true) end)
+    f:RegisterEvent("ACTIONBAR_UPDATE_COOLDOWN")
+    f:RegisterEvent("SPELL_UPDATE_COOLDOWN")
+    f:RegisterEvent("BAG_UPDATE_COOLDOWN")
+    f:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+    f:SetScript("OnEvent", function() P:Refresh(true) end)
+    f:Hide()
+    self.frame = f
+    self:Layout()
+    self:AttachToBar()
+end
+
+-- Settings changed: layout, what is shown
+function P:Apply()
+    if not self.frame then return end
+    self:Layout()
+    self:UpdateVisibility()
+    self:Refresh(true)
+end
+
+---------------------------------------------------------------------------
+-- Placing the extra buttons, on the HUD (from the configuration's Gamepad
+-- tab): each one goes on a fixed place around the bar's controls (two
+-- columns on the outer side, two rows above and two below). The D-pad goes
+-- from place to place, onto a taken place the two buttons swap; LB / RB pick
+-- the button, Y mirrors the other side, X puts it back. With the mouse: click
+-- a button, then one of the places shown.
+---------------------------------------------------------------------------
+P.PLACES = {}
+for _, x in ipairs({ -182, -234 }) do
+    for _, y in ipairs({ 52, 26, 0, -26, -52 }) do P.PLACES[#P.PLACES + 1] = { x = x, y = y } end
+end
+-- Two rows above and two below, the outer ones a little further away
+for _, y in ipairs({ 117, 78, -78, -117 }) do
+    for _, x in ipairs({ -143, -104, -65, -26 }) do P.PLACES[#P.PLACES + 1] = { x = x, y = y } end
+end
+
+-- The places on a side (the right side mirrors the left one)
+local function sidePlace(side, place)
+    return side < 0 and place.x or -place.x, place.y
+end
+
+local function nearestPlace(side, x, y)
+    local best, bx, by
+    for _, place in ipairs(P.PLACES) do
+        local px, py = sidePlace(side, place)
+        local d = (px - x) ^ 2 + (py - y) ^ 2
+        if not best or d < best then best, bx, by = d, px, py end
+    end
+    return bx, by
+end
+P.NearestPlace = nearestPlace
+
+function P:SetPosition(id, x, y)
+    settings().extraPos[id] = { x = x, y = y }
+    if settings().extraSymmetric then
+        settings().extraPos[PARTNER[id]] = { x = -x, y = y }
+    end
+end
+
+-- Free placement turned off: each button on the nearest fixed place left
+-- (the shown ones first), never two on the same one
+function P:SnapAll()
+    local saved, taken, list, hidden = settings().extraPos, {}, {}, {}
+    for _, id in ipairs(P.EXTRA) do
+        local b = self.frame and self.frame.buttons[id]
+        if b and b:IsShown() then list[#list + 1] = id else hidden[#hidden + 1] = id end
+    end
+    for _, id in ipairs(hidden) do list[#list + 1] = id end
+    for _, id in ipairs(list) do
+        local pos = saved[id]
+        if type(pos) ~= "table" or type(pos.x) ~= "number" or type(pos.y) ~= "number" then pos = P.DEFAULT_POS[id] end
+        local best, bx, by
+        for _, place in ipairs(P.PLACES) do
+            local px, py = sidePlace(SIDE[id], place)
+            local d = (px - pos.x) ^ 2 + (py - pos.y) ^ 2
+            if not taken[px .. "," .. py] and (not best or d < best) then best, bx, by = d, px, py end
+        end
+        if bx then
+            taken[bx .. "," .. by] = true
+            saved[id] = { x = bx, y = by }
+        end
+    end
+end
+
+-- Onto a place: the button already there (same side) takes the old place
+function P:MoveTo(id, x, y)
+    local ox, oy = self:Position(id)
+    for _, other in ipairs(P.EXTRA) do
+        if other ~= id and SIDE[other] == SIDE[id] then
+            local px, py = self:Position(other)
+            if px == x and py == y then self:SetPosition(other, ox, oy) end
+        end
+    end
+    self:SetPosition(id, x, y)
+end
+
+local DIRS = { UP = { 0, 1 }, DOWN = { 0, -1 }, LEFT = { -1, 0 }, RIGHT = { 1, 0 } }
+local FREE_STEP = 4
+
+-- Free placement with the mouse: the button follows the cursor while held
+function P:StartDrag(b)
+    local x, y = self:Position(b.id)
+    local cx, cy = GetCursorPosition()
+    self.drag = { id = b.id, x = x, y = y, cx = cx, cy = cy, scale = b:GetEffectiveScale() }
+end
+
+function P:Drag()
+    local d = self.drag
+    if not (IsMouseButtonDown and IsMouseButtonDown("LeftButton")) then
+        self.drag = nil
+        return
+    end
+    local cx, cy = GetCursorPosition()
+    self:SetPosition(d.id, math.floor(d.x + (cx - d.cx) / d.scale + 0.5), math.floor(d.y + (cy - d.cy) / d.scale + 0.5))
+    self:Layout()
+end
+
+function P:Step(id, dir)
+    local x, y = self:Position(id)
+    local dx, dy = DIRS[dir][1], DIRS[dir][2]
+    -- Free placement: a few pixels at a time (held, the D-pad repeats)
+    if settings().extraFree then
+        self:SetPosition(id, x + dx * FREE_STEP, y + dy * FREE_STEP)
+        return
+    end
+    local best, bx, by
+    for _, place in ipairs(P.PLACES) do
+        local px, py = sidePlace(SIDE[id], place)
+        local vx, vy = px - x, py - y
+        local along = vx * dx + vy * dy
+        local across = math.abs(vx * dy - vy * dx)
+        if along > 0 and across <= along * 1.8 + 20 then
+            local score = along + across * 2
+            if not best or score < best then best, bx, by = score, px, py end
+        end
+    end
+    if best then self:MoveTo(id, bx, by) end
+end
+
+---------------------------------------------------------------------------
+-- The game's gamepad bar moves too, by steps, and changes size (asked): its
+-- place on the screen and its scale, out of combat, and only once the
+-- player changed them. Its scale takes all of it at once: its four bars (no
+-- trigger, LT, RT, LT + RT), the targeting bars (LB / RB), the class
+-- actions; what the addon puts on and around it follows it (the extra
+-- buttons hang on its anchors at its scale, the pictures on its buttons are
+-- theirs, the trigger toggle's bar takes its scale). It grows from its
+-- bottom middle, where the game anchors it: offsets are in the bar's own
+-- scale, so they are divided by it to keep its place.
+---------------------------------------------------------------------------
+local BAR_STEP_X, BAR_STEP_Y = 40, 20
+P.BAR_SCALE_MIN, P.BAR_SCALE_MAX, P.BAR_SCALE_STEP = 0.7, 1.5, 0.05
+
+-- Since the game's patch of 9 October 2026 its gamepad bar is one of Edit
+-- Mode's frames: Edit Mode places it (the player moves it there) and has put
+-- its own SetPoint, ClearAllPoints and SetScale on it. Those are never called
+-- from here (the addon's code running in Edit Mode's would spread to it):
+-- the size goes through the game's own, which Edit Mode keeps (SetScaleBase,
+-- SetPointBase), the place stays Edit Mode's, the steps (barOffset) unused.
+function P.EditModeBar(bar)
+    bar = bar or GamepadMainActionBarFrame
+    return bar ~= nil and bar.system ~= nil and type(bar.SetScaleBase) == "function"
+        and type(bar.SetPointBase) == "function"
+end
+
+-- The game's compact action bar (one bar shown): an Edit Mode setting of
+-- its bar since that patch, a game setting before
+function P.CompactBar()
+    local bar = GamepadMainActionBarFrame
+    if P.EditModeBar(bar) and type(bar.SetUseCompactLayout) == "function" then
+        return bar.useCompactLayout == true
+    end
+    return GetCVarBool and GetCVarBool("GamepadUseCompactActionBar") and true or false
+end
+
+function P:BarOffset()
+    local off = settings().barOffset
+    return off and tonumber(off.x) or 0, off and tonumber(off.y) or 0
+end
+
+-- The bar's size (1: the game's), kept within its bounds
+function P:BarScale()
+    local k = tonumber(settings().barScale) or 1
+    return math.max(P.BAR_SCALE_MIN, math.min(P.BAR_SCALE_MAX, k))
+end
+
+-- A step bigger (1) or smaller (-1), in 5 % steps
+function P:ScaleBar(delta)
+    local k = self:BarScale() + delta * P.BAR_SCALE_STEP
+    k = math.floor(k * 100 + 0.5) / 100
+    settings().barScale = math.max(P.BAR_SCALE_MIN, math.min(P.BAR_SCALE_MAX, k))
+    self:ApplyBarOffset()
+end
+
+-- Edit Mode's bar: its size only, its place kept (its anchors' offsets in
+-- its new scale, as Edit Mode does it itself)
+function P:ScaleEditModeBar(bar)
+    local plain = CK.Plain
+    local k, old = self:BarScale(), plain(bar:GetScale())
+    -- (its size or place secret: left as it is)
+    if not old or math.abs(old - k) < 0.001 then return end
+    if InCombatLockdown() then
+        self.pendingBar = true
+        return
+    end
+    local points = {}
+    for i = 1, bar:GetNumPoints() do
+        local point, relativeTo, relativePoint, x, y = bar:GetPoint(i)
+        if point then
+            x, y = x == nil and 0 or plain(x), y == nil and 0 or plain(y)
+            if not (x and y) then return end
+            points[#points + 1] = { point, relativeTo, relativePoint, x * old / k, y * old / k }
+        end
+    end
+    self.pendingBar = false
+    bar:SetScaleBase(k)
+    for _, p in ipairs(points) do bar:SetPointBase(unpack(p)) end
+    if CK.ConsumableWheel and CK.ConsumableWheel.PlacePartyKeys then CK.ConsumableWheel:PlacePartyKeys() end
+end
+
+function P:ApplyBarOffset()
+    local bar = GamepadMainActionBarFrame
+    if P.EditModeBar(bar) then return self:ScaleEditModeBar(bar) end
+    local x, y = self:BarOffset()
+    local k = self:BarScale()
+    if not bar or (x == 0 and y == 0 and k == 1 and not self.barMoved) then return end
+    if InCombatLockdown() then
+        self.pendingBar = true
+        return
+    end
+    self.pendingBar = false
+    -- The game's own place (MainActionBarFrame.xml), read once
+    if not self.barPoint then
+        local point, relativeTo, relativePoint, px, py = bar:GetPoint(1)
+        if point and relativeTo == UIParent and CK.Plain(px) and CK.Plain(py) then
+            self.barPoint = { point, relativePoint, px, py }
+        else
+            self.barPoint = { "BOTTOM", "BOTTOM", 0, 110 }
+        end
+    end
+    local p = self.barPoint
+    bar:SetScale(k)
+    bar:ClearAllPoints()
+    bar:SetPoint(p[1], UIParent, p[2], (p[3] + x * BAR_STEP_X) / k, (p[4] + y * BAR_STEP_Y) / k)
+    self.barMoved = true
+    -- Its buttons moved: the party wheels open on them where they are now
+    if CK.ConsumableWheel and CK.ConsumableWheel.PlacePartyKeys then CK.ConsumableWheel:PlacePartyKeys() end
+end
+
+function P:MoveBar(dx, dy)
+    -- (placed in the game's Edit Mode)
+    if P.EditModeBar() then return end
+    local x, y = self:BarOffset()
+    local w, h = UIParent:GetWidth() or 1920, UIParent:GetHeight() or 1080
+    -- (bigger, it has less room)
+    local k = self:BarScale()
+    local maxX = math.max(0, math.floor((w / 2 - 340 * k) / BAR_STEP_X))
+    local maxY = math.max(0, math.floor((h - 340 * k) / BAR_STEP_Y))
+    x = math.max(-maxX, math.min(maxX, x + dx))
+    y = math.max(-5, math.min(maxY, y + dy))
+    settings().barOffset = { x = x, y = y }
+    self:ApplyBarOffset()
+end
+
+-- What can be placed: the bar, then each extra button
+P.PLACE_ORDER = { "BAR", "L4", "L5", "L3", "R4", "R5", "R3", "TL1", "TL2", "TL3", "TL4", "TR1", "TR2", "TR3", "TR4" }
+
+-- Placing works in two steps: the D-pad chooses an element (the bar or a
+-- button, by where it is on the screen), A picks it up; then the D-pad moves
+-- it, A puts it down, B puts it back where it was
+local GOLD_RING, GRAB_RING = { 1, 0.85, 0.3 }, { 0.45, 1, 0.45 }
+
+function P:SelectForPlacement(id)
+    self.placeSelected = id
+    self.grabbed = nil
+    self:RenderPlacementRings()
+    self:RenderPlacement()
+end
+
+function P:RenderPlacementRings()
+    local id = self.placeSelected
+    local color = self.grabbed and GRAB_RING or GOLD_RING
+    for _, other in ipairs(P.EXTRA) do
+        local ring = self.frame.buttons[other].ring
+        ring:SetShown(other == id)
+        ring:SetVertexColor(color[1], color[2], color[3])
+    end
+    if self.barRing then
+        self.barRing:SetShown(id == "BAR")
+        self.barRing.box:SetColors(color, 0.08, color, 1)
+        -- Picked up, an Edit Mode bar (since the game's patch of 9 October):
+        -- said in its frame, where the eyes are (reported: it went green as
+        -- if it could move, the D-pad did nothing), its size only here
+        local note = self.barRing.note
+        if note then
+            local on = id == "BAR" and self.grabbed ~= nil and P.EditModeBar()
+            if on then
+                local g = function(key) return CK:GlyphMarkup(key, 16) end
+                note.size:SetText(format(L.PLACE_BAR_SIZE_HERE, g("LB") .. g("RB")))
+                note.move:SetText(format(L.PLACE_BAR_MOVE_EDITMODE, HUD_EDIT_MODE_MENU or "Edit Mode"))
+                note:SetSize(math.max(note.size:GetStringWidth() or 0, note.move:GetStringWidth() or 0) + 28, 52)
+            end
+            note:SetShown(on and true or false)
+        end
+    end
+    self:UpdatePlaceTag()
+    -- The places only matter for a button being moved
+    for _, m in ipairs(self.markers or {}) do m:SetShown(id ~= "BAR" and not settings().extraFree) end
+end
+
+-- The bar's buttons on the screen (the game's frame is much larger than
+-- them: reported, a big rectangle that didn't say what it moved): their
+-- bounds, in UIParent's units, the stance bar's in its place. None when
+-- the game keeps them secret (its build of 2 November 2026)
+function P:BarBounds()
+    local plain = CK.Plain
+    local ui = UIParent:GetEffectiveScale() or 1
+    local l, r, t, b
+    local function add(f)
+        if not (f and f.IsVisible and f:IsVisible() and f.GetLeft) then return end
+        local fl, fr, ft, fb = plain(f:GetLeft()), plain(f:GetRight()), plain(f:GetTop()), plain(f:GetBottom())
+        if not (fl and fr and ft and fb) then return end
+        local k = (plain(f:GetEffectiveScale()) or 1) / ui
+        fl, fr, ft, fb = fl * k, fr * k, ft * k, fb * k
+        l, r = l and math.min(l, fl) or fl, r and math.max(r, fr) or fr
+        t, b = t and math.max(t, ft) or ft, b and math.min(b, fb) or fb
+    end
+    for _, bar in ipairs(P.BARS) do
+        for _, button in ipairs(P.BUTTONS) do add(self:LiveButton("bar:" .. bar.key .. ":" .. button.key)) end
+    end
+    if not l then add(GamepadMainActionBarFrame) end
+    return l, r, t, b
+end
+
+-- What is selected, said over it: its name (the bar: its size too), gold
+-- while chosen, green while picked up
+function P:UpdatePlaceTag()
+    local tag = self.placeTag
+    if not tag then return end
+    local id = self.placeSelected
+    local color = self.grabbed and GRAB_RING or GOLD_RING
+    local target
+    if id == "BAR" then
+        local l, r, t, b = self:BarBounds()
+        if self.barRing and l then
+            self.barRing:ClearAllPoints()
+            self.barRing:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", l - 6, t + 6)
+            self.barRing:SetPoint("BOTTOMRIGHT", UIParent, "BOTTOMLEFT", r + 6, b - 6)
+        end
+        target = self.barRing
+        tag.text:SetText(format("%s  %d %%", L.PLACE_BAR, math.floor(self:BarScale() * 100 + 0.5)))
+    else
+        target = id and self.frame.buttons[id]
+        tag.text:SetText(id or "")
+    end
+    if not (target and target:IsShown()) then
+        tag:Hide()
+        return
+    end
+    tag.text:SetTextColor(color[1], color[2], color[3])
+    tag.box:SetColors({ 0.04, 0.04, 0.04 }, 0.85, color, 1)
+    tag:SetSize(math.max(40, (tag.text:GetStringWidth() or 0) + 20), 22)
+    tag:ClearAllPoints()
+    tag:SetPoint("BOTTOM", target, "TOP", 0, id == "BAR" and 4 or 14)
+    tag:Show()
+end
+
+-- Without the places on the screen (the game's secret, its build of
+-- 2 November 2026: the extra buttons, anchored to its bar, too), the D-pad
+-- goes by the places the addon gives: the bar's middle at 0, its buttons
+-- about 540 x 150, each extra button at its place from its side's anchor
+-- (200 from the middle)
+local logical = false
+local LOGICAL_BAR_W, LOGICAL_BAR_H, LOGICAL_ANCHOR_X = 270, 75, 200
+
+-- The bar's buttons' bounds on the screen, in pixels (its gold frame's)
+local function barRect()
+    if logical then return -LOGICAL_BAR_W, LOGICAL_BAR_W, LOGICAL_BAR_H, -LOGICAL_BAR_H end
+    local l, r, t, b = P:BarBounds()
+    if not l then return nil end
+    local k = UIParent:GetEffectiveScale() or 1
+    return l * k, r * k, t * k, b * k
+end
+
+-- Center of an element on the screen. The bar: its buttons' middle (its
+-- game frame, an Edit Mode system, is much larger than them: its centre far
+-- from them, the bar never reached from the extra buttons, reported)
+local function screenCenter(id)
+    if logical then
+        if id == "BAR" then return 0, 0 end
+        if not SIDE[id] then return nil end
+        local x, y = P:Position(id)
+        return SIDE[id] * LOGICAL_ANCHOR_X + x, y
+    end
+    if id == "BAR" then
+        local l, r, t, b = barRect()
+        if l then return (l + r) / 2, (t + b) / 2 end
+    end
+    local f = id == "BAR" and GamepadMainActionBarFrame or P.frame.buttons[id]
+    if not f then return nil end
+    local x, y = f:GetCenter()
+    x, y = CK.Plain(x), CK.Plain(y)
+    if not (x and y) then return nil end
+    local scale = CK.Plain(f:GetEffectiveScale()) or 1
+    return x * scale, y * scale
+end
+
+-- Every element shown has its place on the screen (none secret), the bar
+-- its buttons' bounds
+local function screenPlaces(order)
+    if GamepadMainActionBarFrame and not P:BarBounds() then return false end
+    for _, id in ipairs(order) do
+        local shown = id == "BAR" or (P.frame.buttons[id] and P.frame.buttons[id]:IsShown())
+        if shown and not screenCenter(id) then return false end
+    end
+    return true
+end
+
+-- Where an element is, seen from a point: the bar, its buttons' nearest
+-- point (pressing toward it reaches it, from any side); a button, its centre
+local function seenFrom(id, fx, fy)
+    if id == "BAR" then
+        local l, r, t, b = barRect()
+        if l then
+            local x, y = math.max(l, math.min(r, fx)), math.max(b, math.min(t, fy))
+            if x ~= fx or y ~= fy then return x, y end
+        end
+    end
+    return screenCenter(id)
+end
+
+-- The nearest element in a D-pad direction
+function P:SelectToward(dir)
+    local order = GamepadMainActionBarFrame and P.PLACE_ORDER or P.EXTRA
+    -- The places on the screen, else the addon's own
+    logical = false
+    logical = not screenPlaces(order)
+    local fx, fy = screenCenter(self.placeSelected)
+    if not fx then return end
+    -- From the bar: from its buttons' edge nearest each element
+    local rect = self.placeSelected == "BAR" and { barRect() }
+    local dx, dy = DIRS[dir][1], DIRS[dir][2]
+    local best, bestScore
+    for _, id in ipairs(order) do
+        local x, y = seenFrom(id, fx, fy)
+        if rect and rect[1] and x then
+            local l, r, t, b = rect[1], rect[2], rect[3], rect[4]
+            local ox, oy = math.max(l, math.min(r, x)), math.max(b, math.min(t, y))
+            if ox ~= x or oy ~= y then fx, fy = ox, oy else fx, fy = (l + r) / 2, (t + b) / 2 end
+        end
+        local shown = id == "BAR" or (self.frame.buttons[id] and self.frame.buttons[id]:IsShown())
+        if id ~= self.placeSelected and x and shown then
+            local vx, vy = x - fx, y - fy
+            local along = vx * dx + vy * dy
+            local across = math.abs(vx * dy - vy * dx)
+            if along > 0 and across <= along * 2 + 40 then
+                local score = along + across * 2
+                if not bestScore or score < bestScore then best, bestScore = id, score end
+            end
+        end
+    end
+    logical = false
+    if best then self:SelectForPlacement(best) end
+end
+
+function P:Grab()
+    local id = self.placeSelected
+    if id == "BAR" then
+        local x, y = self:BarOffset()
+        self.grabbed = { bar = true, x = x, y = y, scale = settings().barScale }
+    else
+        local all = {}
+        for _, other in ipairs(P.EXTRA) do
+            local ox, oy = self:Position(other)
+            all[other] = { x = ox, y = oy }
+        end
+        self.grabbed = { all = all, symmetric = settings().extraSymmetric }
+    end
+    self:RenderPlacementRings()
+    self:RenderPlacement()
+end
+
+-- B while moving: everything back where it was
+function P:CancelGrab()
+    local g, id = self.grabbed, self.placeSelected
+    if not g then return end
+    if g.bar then
+        settings().barOffset = { x = g.x, y = g.y }
+        settings().barScale = g.scale
+        self:ApplyBarOffset()
+    else
+        for other, pos in pairs(g.all) do settings().extraPos[other] = { x = pos.x, y = pos.y } end
+        settings().extraSymmetric = g.symmetric
+    end
+    self.grabbed = nil
+    self:Layout()
+    self:RenderPlacementRings()
+    self:RenderPlacement()
+end
+
+-- The places, shown while placing (dotted rings, clickable)
+function P:BuildMarkers()
+    if self.markers then return end
+    self.markers = {}
+    for _, side in ipairs({ -1, 1 }) do
+        for _, place in ipairs(P.PLACES) do
+            local m = CK.NewFrame("Button", nil, self.frame)
+            m:SetSize(30, 30)
+            m:SetFrameLevel(math.max(1, self.frame:GetFrameLevel() - 1))
+            local ring = m:CreateTexture(nil, "BACKGROUND")
+            ring:SetAllPoints()
+            atlasOr(ring, "gamepad-actionbar-circleslot-border-normal", "Interface\\Minimap\\MiniMap-TrackingBorder")
+            ring:SetAlpha(0.35)
+            m.side = side
+            m.x, m.y = sidePlace(side, place)
+            m:SetScript("OnClick", function(self)
+                local id = P.placeSelected
+                if id and SIDE[id] == self.side then
+                    P:MoveTo(id, self.x, self.y)
+                    P:Layout()
+                end
+            end)
+            m:Hide()
+            self.markers[#self.markers + 1] = m
+        end
+    end
+end
+
+function P:LayoutMarkers()
+    if not self.markers then return end
+    local unit = GamepadMainActionBarFrame and GamepadMainActionBarFrame.PageUnit
+    for _, m in ipairs(self.markers) do
+        m:ClearAllPoints()
+        local anchor = unit and (m.side < 0 and unit.LeftCenteredAnchor or unit.RightCenteredAnchor)
+        if anchor then
+            m:SetPoint("CENTER", anchor, "CENTER", m.x, m.y)
+        else
+            m:SetPoint("CENTER", self.frame, "CENTER", m.x + m.side * 195, m.y)
+        end
+    end
+end
+
+function P:StartPlacement()
+    self:BuildFrame()
+    self.placing = true
+    if not self.banner then
+        local banner = CK.NewFrame("Frame", nil, UIParent)
+        banner:SetSize(620, 58)
+        banner:SetPoint("TOP", 0, -90)
+        banner:SetFrameStrata("DIALOG")
+        CK.Config.panel(banner)
+        banner.title = CK.UIKit.text(banner, 14)
+        banner.title:SetPoint("TOP", 0, -10)
+        banner.title:SetTextColor(unpack(CK.UIKit.C.gold))
+        banner.title:SetText(L.PLACE_TITLE)
+        banner.help = CK.UIKit.text(banner, 11)
+        banner.help:SetPoint("BOTTOM", 0, 10)
+        banner.help:SetTextColor(unpack(CK.UIKit.C.btn))
+        self.banner = banner
+    end
+    self:BuildMarkers()
+    self:LayoutMarkers()
+    -- A thin frame around the bar's buttons while it is the one placed (gold
+    -- chosen, green picked up), and a tag over what is selected: its name
+    local bar = GamepadMainActionBarFrame
+    if bar and not self.barRing then
+        local ring = CK.NewFrame("Frame", nil, UIParent)
+        ring:SetPoint("TOPLEFT", bar, "TOPLEFT", -6, 6)
+        ring:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", 6, -6)
+        ring:SetFrameStrata("HIGH")
+        ring.box = CK.ConfigKit.Box(ring, 4, 2, "OVERLAY")
+        ring.box:SetPoints(ring)
+        -- An Edit Mode bar picked up: its size here, its place in Edit Mode
+        local note = CK.NewFrame("Frame", nil, ring)
+        note:SetPoint("CENTER")
+        note:SetSize(300, 52)
+        note.box = CK.ConfigKit.Box(note, 4, 1, "BACKGROUND")
+        note.box:SetPoints(note)
+        note.box:SetColors({ 0.04, 0.04, 0.04 }, 0.9, GRAB_RING, 1)
+        note.size = note:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        note.size:SetPoint("TOP", 0, -9)
+        note.move = note:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        note.move:SetPoint("TOP", note.size, "BOTTOM", 0, -5)
+        note:Hide()
+        ring.note = note
+        ring:Hide()
+        self.barRing = ring
+    end
+    if not self.placeTag then
+        local tag = CK.NewFrame("Frame", nil, UIParent)
+        tag:SetFrameStrata("DIALOG")
+        tag.box = CK.ConfigKit.Box(tag, 4, 1, "BACKGROUND")
+        tag.box:SetPoints(tag)
+        tag.text = tag:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        tag.text:SetPoint("CENTER")
+        -- Follows the bar as it moves or grows
+        local elapsed = 0
+        tag:SetScript("OnUpdate", function(_, dt)
+            elapsed = elapsed + dt
+            if elapsed < 0.1 then return end
+            elapsed = 0
+            P:UpdatePlaceTag()
+        end)
+        tag:Hide()
+        self.placeTag = tag
+    end
+    self.banner:Show()
+    self:UpdateVisibility()
+    self:Layout()
+    self:SelectForPlacement(self.placeSelected or (bar and "BAR" or "L4"))
+end
+
+function P:StopPlacement()
+    if not self.placing then return end
+    self.placing = false
+    if self.banner then self.banner:Hide() end
+    if self.barRing then self.barRing:Hide() end
+    if self.placeTag then self.placeTag:Hide() end
+    for _, m in ipairs(self.markers or {}) do m:Hide() end
+    for _, id in ipairs(P.EXTRA) do self.frame.buttons[id].ring:Hide() end
+    self:Apply()
+end
+
+function P:RenderPlacement()
+    local g = function(key) return CK:GlyphMarkup(key, 16) end
+    local id = self.placeSelected
+    local name = id == "BAR" and L.PLACE_BAR or id
+    if self.grabbed then name = name .. " - " .. L.PLACE_MOVING end
+    self.banner.title:SetText(L.PLACE_TITLE .. "  |cffffffff" .. name .. "|r")
+    local parts
+    if self.grabbed then
+        -- Edit Mode's bar: its size here, its place in Edit Mode
+        -- (said in its frame: PLACE_BAR_MOVE_EDITMODE)
+        local sizeOnly = id == "BAR" and P.EditModeBar()
+        parts = {}
+        if not sizeOnly then parts[1] = g("DPAD_UP") .. " " .. (id == "BAR" and L.MAP_P_MOVE or L.PLACE_P_PLACE) end
+        if id ~= "BAR" then
+            local sym = settings().extraSymmetric and L.ON or L.OFF
+            parts[#parts + 1] = g("Y") .. " " .. format(L.PLACE_P_SYM, sym)
+        else
+            -- The bar's size: LB smaller, RB bigger
+            parts[#parts + 1] = g("LB") .. g("RB") .. " " .. format(L.PLACE_P_SIZE, math.floor(self:BarScale() * 100 + 0.5))
+        end
+        parts[#parts + 1] = g("X") .. " " .. (id ~= "BAR" and L.PLACE_P_RESET
+            or sizeOnly and L.PLACE_P_RESET_SIZE or L.PLACE_P_RESET_BAR)
+        parts[#parts + 1] = g("A") .. " " .. L.PLACE_P_DROP
+        parts[#parts + 1] = g("B") .. " " .. L.PLACE_P_CANCEL
+    else
+        parts = {
+            g("DPAD_UP") .. " " .. L.PLACE_P_SELECT, g("A") .. " " .. L.PLACE_P_GRAB,
+            g("LB") .. g("RB") .. " " .. L.PLACE_P_BUTTON, g("B") .. " " .. L.PLACE_P_DONE,
+        }
+    end
+    self.banner.help:SetText(table.concat(parts, "    "))
+    self:UpdatePlaceTag()
+end
+
+function P:PlacementPress(name)
+    local id = self.placeSelected
+    if not self.grabbed then
+        if DIRS[name] then
+            self:SelectToward(name)
+        elseif name == "A" then
+            self:Grab()
+        elseif name == "LB" or name == "RB" then
+            local order = GamepadMainActionBarFrame and P.PLACE_ORDER or P.EXTRA
+            -- The ones shown only (a touchpad button turned off is not)
+            local shown = {}
+            for _, other in ipairs(order) do
+                if other == "BAR" or (self.frame.buttons[other] and self.frame.buttons[other]:IsShown()) then
+                    shown[#shown + 1] = other
+                end
+            end
+            local index = 1
+            for i, other in ipairs(shown) do
+                if other == id then index = i end
+            end
+            self:SelectForPlacement(shown[(index - 1 + (name == "LB" and -1 or 1)) % #shown + 1])
+        elseif name == "B" then
+            self:StopPlacement()
+            CK.Config:EndPlacement()
+        end
+        return
+    end
+    -- Moving the element picked up
+    if name == "A" then
+        self.grabbed = nil
+        self:RenderPlacementRings()
+    elseif name == "B" then
+        self:CancelGrab()
+        return
+    elseif id == "BAR" then
+        if DIRS[name] then
+            self:MoveBar(DIRS[name][1], DIRS[name][2])
+        elseif name == "LB" or name == "RB" then
+            self:ScaleBar(name == "LB" and -1 or 1)
+        elseif name == "X" then
+            -- The game's place and size
+            settings().barOffset = { x = 0, y = 0 }
+            settings().barScale = 1
+            self:ApplyBarOffset()
+        end
+    elseif DIRS[name] then
+        self:Step(id, name)
+    elseif name == "Y" then
+        settings().extraSymmetric = not settings().extraSymmetric
+        if settings().extraSymmetric then
+            for _, other in ipairs(P.EXTRA) do
+                if SIDE[other] == SIDE[id] then self:SetPosition(other, self:Position(other)) end
+            end
+        end
+    elseif name == "X" then
+        local pos = P.DEFAULT_POS[id]
+        self:MoveTo(id, pos.x, pos.y)
+    end
+    self:Layout()
+    self:RenderPlacement()
+end
+
+function P:Init()
+    self:BuildFrame()
+    watchKeys()
+    self:Apply()
+    local events = CreateFrame("Frame")
+    events:RegisterEvent("ADDON_LOADED")
+    events:RegisterEvent("PLAYER_REGEN_ENABLED")
+    events:RegisterEvent("PLAYER_ENTERING_WORLD")
+    events:SetScript("OnEvent", function(_, event, name)
+        if event == "PLAYER_REGEN_ENABLED" then
+            watchKeys()
+            if P.pendingBar then P:ApplyBarOffset() end
+        elseif event == "PLAYER_ENTERING_WORLD" then
+            P:ApplyBarOffset()
+        elseif name == "Blizzard_GamepadActionBars" then
+            P:ApplyBarOffset()
+            -- The game's gamepad bars may load later (gamepad interface turned on)
+            P:AttachToBar()
+            P:Apply()
+            CK.Mapping:Apply()
+        end
+    end)
+end
+
+---------------------------------------------------------------------------
+-- /ec keys: every key and gamepad button the game receives, for 15 seconds,
+-- and which pad buttons act as Shift / Ctrl / Alt
+---------------------------------------------------------------------------
+local DETECT_TIME = 15
+
+-- "[Shift Alt | LT RT]": the modifiers held and the triggers the gamepad's
+-- state shows held (for /ec keys: what a paddle's layer is read from)
+function CK:HeldText()
+    local mods = {}
+    if IsShiftKeyDown() then mods[#mods + 1] = "Shift" end
+    if IsControlKeyDown() then mods[#mods + 1] = "Ctrl" end
+    if IsAltKeyDown() then mods[#mods + 1] = "Alt" end
+    local state = padState()
+    local pads = {}
+    if padButtonDown(state, "PADLTRIGGER") then pads[#pads + 1] = "LT" end
+    if padButtonDown(state, "PADRTRIGGER") then pads[#pads + 1] = "RT" end
+    return format("[%s | %s%s]", #mods > 0 and table.concat(mods, " ") or "-",
+        #pads > 0 and table.concat(pads, " ") or "-", state and "" or " (no gamepad state)")
+end
+
+function CK:DetectKeys()
+    if InCombatLockdown() then
+        self:BlockedByCombat()
+        return
+    end
+    local f = self.detectFrame
+    if not f then
+        f = CK.NewFrame("Frame", nil, UIParent)
+        f:EnableKeyboard(true)
+        f:SetScript("OnKeyDown", function(frame, key)
+            -- Let the key do its usual job as well
+            if not InCombatLockdown() then frame:SetPropagateKeyboardInput(true) end
+            -- With what the game sees held: a paddle's layers depend on it
+            local line = key .. "  " .. CK:HeldText()
+            if not frame.seen[line] then
+                frame.seen[line] = true
+                CK:Print(L.DETECT_KEY, line)
+            end
+        end)
+        if f.EnableGamePadButton then
+            f:SetScript("OnGamePadButtonDown", function(frame, button)
+                if not frame.seen[button] then
+                    frame.seen[button] = true
+                    CK:Print(L.DETECT_PAD, button)
+                end
+                return true
+            end)
+        end
+        self.detectFrame = f
+    end
+    f.seen = {}
+    if not InCombatLockdown() then f:SetPropagateKeyboardInput(true) end
+    if f.EnableGamePadButton then f:EnableGamePadButton(true) end
+    f:Show()
+    self:Print(L.DETECT_START, DETECT_TIME)
+    self:Print("Shift = %s, Ctrl = %s, Alt = %s", tostring(GetCVar("GamePadEmulateShift")),
+        tostring(GetCVar("GamePadEmulateCtrl")), tostring(GetCVar("GamePadEmulateAlt")))
+    local token = {}
+    f.token = token
+    C_Timer.After(DETECT_TIME, function()
+        if f.token ~= token then return end
+        f:Hide()
+        if f.EnableGamePadButton and not InCombatLockdown() then f:EnableGamePadButton(false) end
+        CK:Print(L.DETECT_END)
+    end)
+end
