@@ -24,8 +24,13 @@ Interface languages: Russian and English in full; French, German, Spanish and It
 
 ## Installation
 
-Install from CurseForge, or download the archive and put the `DualsenseForever` folder into
-`World of Warcraft\_forever_\Interface\AddOns\`.
+1. Download `DualsenseForever-<version>.zip` from the
+   [latest release](https://github.com/CoolerMgdn/DualsenseForever/releases/latest) (or install from CurseForge).
+2. Unzip it into `World of Warcraft\_forever_\Interface\AddOns\`: you should get
+   `AddOns\DualsenseForever\DualsenseForever.toc`.
+
+Don't use GitHub's green **Code → Download ZIP** button: its folder is named
+`DualsenseForever-main`, and the game won't load an addon whose folder doesn't match its `.toc`.
 
 In game: **/ec** opens the settings, **/ec help** lists the commands.
 
@@ -61,5 +66,10 @@ The detailed manual of the original addon (most of it still applies):
 - **Профили и обмен настройками**: строкой текста между компьютерами.
 - **Мастер настройки** при первом запуске.
 
-Установка: через CurseForge, или распакуйте папку `DualsenseForever` в
-`World of Warcraft\_forever_\Interface\AddOns\`. В игре: **/ec** — настройки, **/ec help** — команды.
+**Установка:** скачайте `DualsenseForever-<версия>.zip` из
+[последнего релиза](https://github.com/CoolerMgdn/DualsenseForever/releases/latest) (или через CurseForge)
+и распакуйте в `World of Warcraft\_forever_\Interface\AddOns\` — должно получиться
+`AddOns\DualsenseForever\DualsenseForever.toc`. Зелёная кнопка **Code → Download ZIP** не подойдёт:
+папка в ней называется `DualsenseForever-main`, и игра такой аддон не загрузит.
+
+В игре: **/ec** — настройки, **/ec help** — команды.
